@@ -1,0 +1,2385 @@
+import sqlite3
+from pathlib import Path
+from datetime import datetime
+import time
+import csv
+import io
+from functools import wraps
+from flask import (
+    Flask, request, redirect, url_for, flash, session,
+    render_template_string, send_from_directory, Response, abort
+)
+from werkzeug.utils import secure_filename
+
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = BASE_DIR / "royal_rices.db"
+UPLOAD_DIR = BASE_DIR / "static" / "uploads"
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+SECRET_ADMIN_CODE = "153486207915348620791534862079"
+
+
+def init_db():
+    con = sqlite3.connect(DB_PATH)
+    con.execute("CREATE TABLE IF NOT EXISTS categories (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE, active INTEGER DEFAULT 1, created_at TEXT)")
+    con.execute("CREATE TABLE IF NOT EXISTS sellers (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, business_name TEXT, phone TEXT UNIQUE, email TEXT, upi_id TEXT, status TEXT DEFAULT 'Pending', created_at TEXT)")
+    con.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
+    cols = [r[1] for r in con.execute("PRAGMA table_info(settings)").fetchall()]
+    if cols and "key" not in cols:
+        con.execute("DROP TABLE IF EXISTS settings")
+        con.execute("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT)")
+    con.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('theme_color', '#8b0000')")
+    con.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('theme_name', 'Royal Red')")
+
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS seller_products (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            seller_id INTEGER,
+            product_name TEXT,
+            category TEXT,
+            description TEXT,
+            price REAL,
+            unit TEXT,
+            stock INTEGER,
+            image TEXT,
+            origin TEXT,
+            farming_method TEXT,
+            processing_info TEXT,
+            storage_details TEXT,
+            certification TEXT,
+            product_type TEXT,
+            organic_tier TEXT,
+            courier_1 TEXT,
+            courier_2 TEXT,
+            delivery_days TEXT,
+            status TEXT DEFAULT 'Pending',
+            admin_note TEXT,
+            rejected_columns TEXT,
+            created_at TEXT
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS products (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            seller_product_id INTEGER,
+            seller_id INTEGER,
+            product_name TEXT,
+            name TEXT,
+            category TEXT,
+            description TEXT,
+            price REAL,
+            unit TEXT,
+            stock INTEGER,
+            image TEXT,
+            origin TEXT,
+            farming_method TEXT,
+            processing_info TEXT,
+            storage_details TEXT,
+            certification TEXT,
+            product_type TEXT,
+            organic_tier TEXT,
+            courier_1 TEXT,
+            courier_2 TEXT,
+            delivery_days TEXT,
+            visible INTEGER DEFAULT 1,
+            status TEXT DEFAULT 'Active',
+            created_at TEXT
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_name TEXT,
+            customer_phone TEXT,
+            phone TEXT,
+            address TEXT,
+            courier_source TEXT,
+            map_pin TEXT,
+            items_summary TEXT,
+            product_name TEXT,
+            product_id INTEGER,
+            quantity INTEGER,
+            total REAL,
+            payment_mode TEXT,
+            upi_utr TEXT,
+            payment_status TEXT DEFAULT 'Paid',
+            order_status TEXT DEFAULT 'Pending',
+            status TEXT DEFAULT 'Pending',
+            courier TEXT,
+            courier_name TEXT,
+            tracking_number TEXT,
+            tracking_id TEXT,
+            seller_dispatch_msg TEXT,
+            admin_contact TEXT,
+            created_at TEXT,
+            rejection_reason TEXT
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS ad_telecasts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT,
+            image_file TEXT,
+            active INTEGER DEFAULT 1,
+            created_at TEXT
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS announcements (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT,
+            announcement_type TEXT,
+            message TEXT,
+            poster_image TEXT,
+            active INTEGER DEFAULT 1,
+            created_at TEXT
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS support_tickets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_name TEXT,
+            customer_phone TEXT,
+            subject TEXT,
+            message TEXT,
+            status TEXT DEFAULT 'Open',
+            admin_reply TEXT,
+            created_at TEXT
+        )
+    """)
+
+    for col_sql in [
+        "ALTER TABLE sellers ADD COLUMN upi_id TEXT",
+        "ALTER TABLE seller_products ADD COLUMN rejected_columns TEXT",
+        "ALTER TABLE seller_products ADD COLUMN admin_note TEXT",
+        "ALTER TABLE seller_products ADD COLUMN product_type TEXT",
+        "ALTER TABLE seller_products ADD COLUMN organic_tier TEXT",
+        "ALTER TABLE seller_products ADD COLUMN courier_1 TEXT",
+        "ALTER TABLE seller_products ADD COLUMN courier_2 TEXT",
+        "ALTER TABLE seller_products ADD COLUMN delivery_days TEXT",
+        "ALTER TABLE products ADD COLUMN seller_product_id INTEGER",
+        "ALTER TABLE products ADD COLUMN seller_id INTEGER",
+        "ALTER TABLE products ADD COLUMN product_name TEXT",
+        "ALTER TABLE products ADD COLUMN product_type TEXT",
+        "ALTER TABLE products ADD COLUMN organic_tier TEXT",
+        "ALTER TABLE products ADD COLUMN courier_1 TEXT",
+        "ALTER TABLE products ADD COLUMN courier_2 TEXT",
+        "ALTER TABLE products ADD COLUMN delivery_days TEXT",
+        "ALTER TABLE orders ADD COLUMN payment_mode TEXT",
+        "ALTER TABLE orders ADD COLUMN upi_utr TEXT",
+        "ALTER TABLE orders ADD COLUMN payment_status TEXT",
+        "ALTER TABLE orders ADD COLUMN courier_source TEXT",
+        "ALTER TABLE orders ADD COLUMN rejection_reason TEXT",
+        "ALTER TABLE announcements ADD COLUMN announcement_type TEXT"
+    ]:
+        try:
+            con.execute(col_sql)
+        except Exception:
+            pass
+
+    cat_count = con.execute("SELECT COUNT(*) FROM categories").fetchone()[0]
+    if cat_count == 0:
+        for c in [
+            "Organic Rice", "Pulses and Dal", "Spices & Condiments", "Grains & Millets",
+            "Cold-Pressed Oils", "Natural Honey & Sweeteners", "Homemade & Handcrafted Spices",
+            "Raw Materials", "Medium Organic Special Selection", "Low Organic Essentials",
+            "High Organic Premium Grade"
+        ]:
+            con.execute("INSERT OR IGNORE INTO categories (name, active, created_at) VALUES (?, 1, datetime('now'))", (c,))
+
+    prod_count = con.execute("SELECT COUNT(*) FROM products").fetchone()[0]
+    if prod_count == 0:
+        con.execute("""
+            INSERT INTO products(
+                product_name, name, category, description, price, unit, stock, image,
+                origin, farming_method, processing_info, storage_details, certification,
+                product_type, organic_tier, visible, status, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'Active', ?)
+        """, (
+            "Rajamudi Red Royal Rice", "Rajamudi Red Royal Rice", "Organic Rice",
+            "Ancient heritage rice of Mysore Wodeyars. Rich in antioxidants, iron, and fiber. Unpolished and stone-hulled.",
+            140.0, "1 kg", 50, "", "Mysuru, Karnataka", "100% Zero-Chemical Natural Farming",
+            "Unpolished & Stone-Hulled", "Store in cool dry airtight container", "NPOP / India Organic Certified",
+            "Finished Product", "High Organic Premium Grade", datetime.now().isoformat()
+        ))
+        con.execute("""
+            INSERT INTO products(
+                product_name, name, category, description, price, unit, stock, image,
+                origin, farming_method, processing_info, storage_details, certification,
+                product_type, organic_tier, visible, status, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'Active', ?)
+        """, (
+            "Malnad Handcrafted Pepper Rasam Masala", "Malnad Handcrafted Pepper Rasam Masala", "Spices & Condiments",
+            "Traditional homemade spice blend crafted with sun-dried black pepper, cumin, and native herbs from Western Ghats.",
+            90.0, "250 g", 30, "", "Malnad, Karnataka", "Handcrafted Home Kitchen Preparation",
+            "Sun-Dried & Hand-Cleaned", "Keep in glass jar away from sunlight", "FSSAI Home Kitchen",
+            "Homemade Spices & Masalas", "Medium Organic Special Selection", datetime.now().isoformat()
+        ))
+
+    con.commit()
+    con.close()
+
+
+init_db()
+
+
+def get_db():
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def get_theme():
+    con = get_db()
+    row = con.execute("SELECT value FROM settings WHERE key='theme_color'").fetchone()
+    name_row = con.execute("SELECT value FROM settings WHERE key='theme_name'").fetchone()
+    con.close()
+    return (row["value"] if row else "#8b0000"), (name_row["value"] if name_row else "Royal Red")
+
+
+app = Flask(__name__)
+app.secret_key = "royal-rices-unified-secret-key"
+
+
+def admin_guard(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not session.get("admin_unlocked"):
+            abort(404)
+        return f(*args, **kwargs)
+    return decorated
+
+
+def sync_seller_product_to_live(con, row):
+    pid = row["id"]
+    con.execute("UPDATE seller_products SET status='Approved' WHERE id=?", (pid,))
+    old = con.execute("SELECT id FROM products WHERE seller_product_id=?", (pid,)).fetchone()
+    pname = row["product_name"]
+    if not old:
+        con.execute("""
+            INSERT INTO products(
+                seller_product_id, seller_id, product_name, name, category, description,
+                price, unit, stock, image, origin, farming_method, processing_info,
+                storage_details, certification, product_type, organic_tier, courier_1,
+                courier_2, delivery_days, visible, status, created_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,'Active',?)
+        """, (
+            pid, row["seller_id"], pname, pname, row["category"], row["description"],
+            row["price"], row["unit"], row["stock"], row["image"], row["origin"],
+            row["farming_method"], row["processing_info"], row["storage_details"],
+            row["certification"], row["product_type"], row["organic_tier"],
+            row["courier_1"], row["courier_2"], row["delivery_days"], datetime.now().isoformat()
+        ))
+    else:
+        con.execute("""
+            UPDATE products SET product_name=?, name=?, category=?, description=?, price=?, unit=?, stock=?, image=?, origin=?, farming_method=?, processing_info=?, storage_details=?, certification=?, product_type=?, organic_tier=?, courier_1=?, courier_2=?, delivery_days=?, visible=1, status='Active'
+            WHERE seller_product_id=?
+        """, (
+            pname, pname, row["category"], row["description"], row["price"], row["unit"],
+            row["stock"], row["image"], row["origin"], row["farming_method"], row["processing_info"],
+            row["storage_details"], row["certification"], row["product_type"], row["organic_tier"],
+            row["courier_1"], row["courier_2"], row["delivery_days"], pid
+        ))
+
+
+@app.route("/uploads/<filename>")
+def uploaded_file(filename):
+    return send_from_directory(UPLOAD_DIR, filename)
+
+
+# ==============================================================================
+# 1. CUSTOMER PORTAL (PUBLIC STOREFRONT)
+# ==============================================================================
+
+def render_store(body, **ctx):
+    cart = session.get("cart", {})
+    cart_count = sum(cart.values())
+    con = get_db()
+    announcements = con.execute("SELECT * FROM announcements WHERE active=1 ORDER BY id DESC").fetchall()
+    con.close()
+    theme_color, _ = get_theme()
+
+    shell = """
+    <!doctype html>
+    <html lang="en">
+    <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>ROYAL RICES — Organic Marketplace</title>
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Cinzel:wght@600;700;800&family=Montserrat:wght@400;500;600;700&display=swap');
+    :root{--bg:#0f0f0f;--card:#181818;--gold:#d4af37;--gold-light:#f3e5ab;--red:__THEME_COLOR__;--red-bright:#ff2400;--text:#f5f5f5;--muted:#b0b0b0;--border:#333333;}
+    *{box-sizing:border-box}
+    body{margin:0;background:var(--bg);color:var(--text);font-family:'Montserrat', sans-serif;min-height:100vh;}
+    header{background:linear-gradient(135deg, #0a0a0a, #1a0505);padding:20px 32px;display:flex;justify-content:space-between;align-items:center;gap:14px;flex-wrap:wrap;border-bottom:3px solid var(--gold);}
+    .logo{font-family:'Cinzel', serif;font-size:26px;font-weight:700;text-decoration:none;color:var(--gold);}
+    .search-box{display:flex;gap:8px;flex:1;max-width:480px;min-width:240px;}
+    .search-box input{flex:1;padding:11px 16px;background:#0d0d0d;border:1px solid var(--border);border-radius:8px;color:var(--text);margin:0;}
+    .search-box button{padding:11px 20px;border-radius:8px;border:1px solid var(--gold);background:var(--red);color:var(--gold-light);font-weight:700;cursor:pointer;}
+    nav{background:#141414;padding:12px 28px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;border-bottom:1px solid var(--border);position:sticky;top:0;z-index:100;}
+    nav a{color:var(--muted);text-decoration:none;padding:9px 14px;border-radius:6px;font-weight:600;}
+    nav a:hover{background:var(--red);color:var(--gold-light);border:1px solid var(--gold);}
+    .wrap{max-width:1280px;margin:28px auto;padding:0 20px;}
+    .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:22px;}
+    .card{background:var(--card);border-radius:14px;padding:22px;border:1px solid var(--border);display:flex;flex-direction:column;justify-content:space-between;}
+    .cat-tag{display:inline-block;background:#201010;color:var(--gold-light);border:1px solid var(--red);font-size:11.5px;font-weight:700;padding:5px 12px;border-radius:20px;margin-bottom:12px;}
+    .price{font-size:22px;font-weight:700;font-family:'Cinzel',serif;color:var(--gold);margin:12px 0;}
+    .btn{display:inline-block;padding:11px 18px;border-radius:8px;border:1px solid var(--gold);background:var(--red);color:var(--gold-light);text-decoration:none;font-weight:600;cursor:pointer;text-align:center;}
+    .btn:hover{background:var(--gold);color:#0a0a0a;}
+    .flash{background:#1c1313;border-left:5px solid var(--red-bright);border:1px solid var(--border);color:var(--gold-light);padding:14px;border-radius:8px;margin-bottom:20px;font-weight:600;}
+    input,select,textarea{width:100%;padding:12px;border:1px solid var(--border);border-radius:8px;margin:6px 0 16px;background:#0d0d0d;color:var(--text);}
+    table{width:100%;border-collapse:collapse;background:#141414;border-radius:10px;overflow:hidden;}
+    th,td{padding:14px;border-bottom:1px solid var(--border);text-align:left;}
+    th{background:#1e1e1e;color:var(--gold);font-family:'Cinzel',serif;}
+
+    .ticker-container{background:linear-gradient(90deg, #1f1400, #381a00, #1f1400);border-bottom:2px solid var(--gold);border-top:2px solid var(--gold);padding:12px 20px;overflow:hidden;white-space:nowrap;position:relative;}
+    .ticker-track{display:inline-block;animation:tickerScroll 25s linear infinite;}
+    .ticker-item{display:inline-block;margin-right:60px;font-weight:700;color:var(--gold-light);font-size:14px;}
+    .ticker-badge{background:var(--red);color:white;padding:3px 8px;border-radius:4px;font-size:11px;margin-right:8px;border:1px solid var(--gold);}
+    @keyframes tickerScroll { 0% { transform: translate3d(0, 0, 0); } 100% { transform: translate3d(-50%, 0, 0); } }
+
+    footer{background:#0a0a0a;color:var(--muted);text-align:center;padding:36px;margin-top:50px;border-top:3px solid var(--gold);}
+    </style>
+    </head>
+    <body>
+    <header>
+        <a href="{{ url_for('cust_home') }}" class="logo">🌾 ROYAL RICES</a>
+        <form class="search-box" action="{{ url_for('cust_search') }}" method="get">
+            <input type="text" name="q" placeholder="Search organic rice, spices..." value="{{ request.args.get('q','') }}">
+            <button type="submit">Search</button>
+        </form>
+    </header>
+    <nav>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;">
+            <a href="{{ url_for('cust_home') }}">Home</a>
+            <a href="{{ url_for('cust_products') }}">All Products</a>
+            <a href="{{ url_for('cust_categories') }}">Categories</a>
+            <a href="{{ url_for('cust_my_orders') }}" style="color:var(--gold);font-weight:700;">📦 My Orders</a>
+            <a href="{{ url_for('cust_track') }}">Track Order</a>
+            <a href="{{ url_for('cust_support') }}" style="color:var(--gold);border:1px solid var(--gold);">💬 Customer Support</a>
+            <a href="{{ url_for('seller_login') }}" style="color:var(--gold);border:1px solid var(--gold);padding:6px 12px;border-radius:6px;">Sell My Product</a>
+        </div>
+        <a href="{{ url_for('cust_cart') }}" class="btn" style="background:var(--gold);color:#0a0a0a;padding:8px 16px;margin:0;">🛒 Cart ({{ cart_count }})</a>
+    </nav>
+
+    {% if announcements %}
+    <div class="ticker-container">
+        <div class="ticker-track">
+            {% for a in announcements %}
+            <span class="ticker-item"><span class="ticker-badge">{{ a['announcement_type'] or 'OFFER' }}</span> 🌟 <b>{{ a['title'] }}:</b> {{ a['message'] }}</span>
+            {% endfor %}
+            {% for a in announcements %}
+            <span class="ticker-item"><span class="ticker-badge">{{ a['announcement_type'] or 'OFFER' }}</span> 🌟 <b>{{ a['title'] }}:</b> {{ a['message'] }}</span>
+            {% endfor %}
+        </div>
+    </div>
+    {% endif %}
+
+    <main class="wrap">
+    {% with ms=get_flashed_messages() %}
+    {% for m in ms %}<div class="flash">{{m}}</div>{% endfor %}
+    {% endwith %}
+    {{ content|safe }}
+    </main>
+    <footer>ROYAL RICES — Pure Organic Agricultural Marketplace</footer>
+    </body>
+    </html>
+    """.replace("__THEME_COLOR__", theme_color)
+    return render_template_string(shell, cart_count=cart_count, announcements=announcements, content=render_template_string(body, **ctx))
+
+
+@app.route("/")
+def cust_home():
+    con = get_db()
+    products = con.execute("SELECT * FROM products WHERE COALESCE(visible,1)=1 ORDER BY id DESC LIMIT 16").fetchall()
+    categories = con.execute("SELECT * FROM categories WHERE COALESCE(active,1)=1 ORDER BY id ASC").fetchall()
+    telecast_ads = [dict(r) for r in con.execute("SELECT * FROM ad_telecasts WHERE active=1 ORDER BY id ASC LIMIT 5").fetchall()]
+    con.close()
+    return render_store("""
+    <style>
+    .hero-telecast-stage {
+        position: relative;
+        overflow: hidden;
+        background: linear-gradient(135deg, #181818, #220808);
+        border: 1px solid var(--gold);
+        border-radius: 16px;
+        margin-bottom: 32px;
+        min-height: 215px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    }
+    .hero-main-banner {
+        width: 100%;
+        padding: 32px;
+        text-align: center;
+        position: relative;
+        z-index: 2;
+        opacity: 1;
+        transition: opacity 0.6s ease-in-out, transform 0.6s ease-in-out;
+    }
+    .hero-main-banner.hidden-banner {
+        opacity: 0;
+        transform: scale(0.96);
+        pointer-events: none;
+    }
+    .telecast-ad-layer {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        z-index: 10;
+        pointer-events: none;
+        user-select: none;
+        opacity: 0;
+        transform: translateY(20px) scale(0.98);
+        transition: opacity 0.6s cubic-bezier(0.16, 1, 0.3, 1), transform 0.6s cubic-bezier(0.16, 1, 0.3, 1);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: #0d0d0d;
+    }
+    .telecast-ad-layer.active-ad {
+        opacity: 1;
+        transform: translateY(0) scale(1);
+    }
+    .telecast-ad-layer img {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+        display: block;
+        pointer-events: none;
+    }
+    </style>
+
+    <div class="hero-telecast-stage" id="heroTelecastStage">
+        <div class="hero-main-banner" id="heroMainBanner">
+            <h1 style="font-family:'Cinzel',serif;color:var(--gold);font-size:32px;margin-bottom:12px;">ROYAL RICES</h1>
+            <p style="color:var(--muted);font-size:15px;max-width:700px;margin:0 auto 20px;">Pure Organic Rice, Pulses, Spices & Natural Products.</p>
+            <div style="display:flex;gap:12px;justify-content:center;flex-wrap:wrap;margin-top:20px;">
+                <a href="{{ url_for('cust_products') }}" class="btn" style="background:var(--gold);color:#0a0a0a;padding:12px 28px;">Explore All Products →</a>
+                <a href="{{ url_for('cust_support') }}" class="btn" style="background:#181818;border:1px solid var(--gold);">💬 Customer Support Center</a>
+            </div>
+        </div>
+
+        {% if telecast_ads %}
+        <div class="telecast-ad-layer" id="telecastAdLayer" aria-hidden="true">
+            <div id="telecastMediaContainer" style="width:100%;height:100%;"></div>
+        </div>
+        {% endif %}
+    </div>
+
+    {% if telecast_ads %}
+    <script>
+    (function() {
+        const ads = {{ telecast_ads | tojson }};
+        if (!ads || ads.length === 0) return;
+
+        const mainBanner = document.getElementById('heroMainBanner');
+        const adLayer = document.getElementById('telecastAdLayer');
+        const mediaContainer = document.getElementById('telecastMediaContainer');
+
+        let currentIndex = 0;
+        const MAIN_BANNER_VISIBLE_MS = 5000;
+        const AD_HOLD_MS = 5000;
+        const FADE_TRANSITION_MS = 600;
+
+        function runTelecastCycle() {
+            const currentAd = ads[currentIndex];
+            const fileUrl = '/uploads/' + currentAd.image_file;
+            const isVideo = fileUrl.toLowerCase().match(/\.(mp4|webm|mov)$/);
+
+            if (isVideo) {
+                mediaContainer.innerHTML = `<video src="${fileUrl}" style="width:100%;height:100%;object-fit:cover;display:block;" autoplay muted loop playsinline></video>`;
+            } else {
+                mediaContainer.innerHTML = `<img src="${fileUrl}" style="width:100%;height:100%;object-fit:cover;display:block;" alt="Advertisement">`;
+            }
+
+            mainBanner.classList.add('hidden-banner');
+            adLayer.classList.add('active-ad');
+
+            setTimeout(() => {
+                adLayer.classList.remove('active-ad');
+                mainBanner.classList.remove('hidden-banner');
+
+                const vid = mediaContainer.querySelector('video');
+                if (vid) { vid.pause(); vid.currentTime = 0; }
+
+                currentIndex = (currentIndex + 1) % ads.length;
+
+                setTimeout(runTelecastCycle, MAIN_BANNER_VISIBLE_MS + FADE_TRANSITION_MS);
+            }, AD_HOLD_MS);
+        }
+
+        setTimeout(runTelecastCycle, 3000);
+    })();
+    </script>
+    {% endif %}
+
+    <h2 style="font-family:'Cinzel',serif;color:var(--gold);margin-bottom:18px;">Shop by Category</h2>
+    <div style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:36px;">
+        {% for c in categories %}
+        <a href="{{ url_for('cust_categories', cat=c['name']) }}" class="btn" style="background:#181818;border:1px solid var(--border);">{{ c['name'] }}</a>
+        {% endfor %}
+    </div>
+
+    <h2 style="font-family:'Cinzel',serif;color:var(--gold);margin-bottom:18px;">Featured Organic Products</h2>
+    <div class="grid">
+        {% for p in products %}
+        <div class="card">
+            <div>
+                {% if p['image'] %}<img src="{{ url_for('uploaded_file', filename=p['image']) }}" style="width:100%;height:175px;object-fit:cover;border-radius:10px;margin-bottom:12px;">{% endif %}
+                <span class="cat-tag">{{ p['category'] }}</span>
+                <h3 style="font-family:'Cinzel',serif;color:var(--gold);margin:6px 0;">{{ p['name'] or p['product_name'] }}</h3>
+                <p style="color:var(--muted);font-size:13.5px;">{{ (p['description'] or '')[:90] }}...</p>
+            </div>
+            <div>
+                <div class="price">₹{{ p['price'] }} / {{ p['unit'] or 'kg' }}</div>
+                <div style="display:flex;gap:10px;">
+                    <a href="{{ url_for('cust_product_detail', pid=p['id']) }}" class="btn" style="flex:1;background:#181818;">Details</a>
+                    <form method="post" action="{{ url_for('cust_add_cart', pid=p['id']) }}" style="flex:1;margin:0;"><button class="btn" style="width:100%;">+ Add</button></form>
+                </div>
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+    """, products=products, categories=categories, telecast_ads=telecast_ads)
+
+
+@app.route("/products")
+def cust_products():
+    con = get_db()
+    products = con.execute("SELECT * FROM products WHERE COALESCE(visible,1)=1 ORDER BY id DESC").fetchall()
+    con.close()
+    return render_store("""
+    <h1 style="font-family:'Cinzel',serif;color:var(--gold);">All Products</h1>
+    <div class="grid">
+        {% for p in products %}
+        <div class="card">
+            <div>
+                {% if p['image'] %}<img src="{{ url_for('uploaded_file', filename=p['image']) }}" style="width:100%;height:175px;object-fit:cover;border-radius:10px;margin-bottom:12px;">{% endif %}
+                <span class="cat-tag">{{ p['category'] }}</span>
+                <h3 style="font-family:'Cinzel',serif;color:var(--gold);">{{ p['name'] or p['product_name'] }}</h3>
+                <p style="color:var(--muted);font-size:13.5px;">{{ p['description'] }}</p>
+            </div>
+            <div>
+                <div class="price">₹{{ p['price'] }} / {{ p['unit'] or 'kg' }}</div>
+                <a href="{{ url_for('cust_product_detail', pid=p['id']) }}" class="btn" style="width:100%;background:#181818;">Details</a>
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+    """, products=products)
+
+
+@app.route("/categories")
+def cust_categories():
+    cat = request.args.get("cat", "").strip()
+    con = get_db()
+    categories = con.execute("SELECT * FROM categories WHERE COALESCE(active,1)=1").fetchall()
+    products = []
+    if cat:
+        products = con.execute("SELECT * FROM products WHERE COALESCE(visible,1)=1 AND (category=? OR organic_tier=?)", (cat, cat)).fetchall()
+    con.close()
+    return render_store("""
+    <h1 style="font-family:'Cinzel',serif;color:var(--gold);">Categories</h1>
+    <div style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:28px;">
+        {% for c in categories %}
+        <a href="{{ url_for('cust_categories', cat=c['name']) }}" class="btn" style="{{ 'background:var(--gold);color:#0a0a0a;' if cat==c['name'] else 'background:#181818;' }}">{{ c['name'] }}</a>
+        {% endfor %}
+    </div>
+    {% if cat %}
+    <h2 style="color:var(--gold);margin-bottom:20px;">Products in "{{ cat }}"</h2>
+    <div class="grid">
+        {% for p in products %}
+        <div class="card">
+            <div>
+                {% if p['image'] %}<img src="{{ url_for('uploaded_file', filename=p['image']) }}" style="width:100%;height:175px;object-fit:cover;border-radius:10px;margin-bottom:12px;">{% endif %}
+                <h3 style="font-family:'Cinzel',serif;color:var(--gold);">{{ p['name'] or p['product_name'] }}</h3>
+                <p style="color:var(--muted);font-size:13.5px;">{{ p['description'] }}</p>
+            </div>
+            <div><div class="price">₹{{ p['price'] }} / {{ p['unit'] }}</div><a href="{{ url_for('cust_product_detail', pid=p['id']) }}" class="btn" style="width:100%;background:#181818;">Details</a></div>
+        </div>
+        {% endfor %}
+    </div>
+    {% endif %}
+    """, categories=categories, products=products, cat=cat)
+
+
+@app.route("/search")
+def cust_search():
+    q = request.args.get("q", "").strip()
+    secret_matched = (q == SECRET_ADMIN_CODE)
+    if secret_matched:
+        session["admin_unlocked"] = True
+
+    con = get_db()
+    like = f"%{q}%"
+    products = con.execute(
+        "SELECT * FROM products WHERE COALESCE(visible,1)=1 AND (name LIKE ? OR product_name LIKE ? OR category LIKE ?)",
+        (like, like, like)
+    ).fetchall()
+    con.close()
+
+    return render_store("""
+    <h1 style="font-family:'Cinzel',serif;color:var(--gold);">Search Results for "{{ q }}"</h1>
+
+    {% if secret_matched %}
+    <div class="card" style="border:1px solid var(--gold);margin-bottom:24px;background:#161616;">
+        <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;">
+            <div>
+                <h3 style="margin:0 0 6px;color:var(--gold);">Control Workspace</h3>
+                <p style="margin:0;color:var(--muted);font-size:13.5px;">Private access granted.</p>
+            </div>
+            <a href="{{ url_for('admin_dashboard') }}" class="btn" style="background:var(--gold);color:#0a0a0a;">Open →</a>
+        </div>
+    </div>
+    {% endif %}
+
+    <div class="grid">
+        {% for p in products %}
+        <div class="card">
+            <div>
+                {% if p['image'] %}<img src="{{ url_for('uploaded_file', filename=p['image']) }}" style="width:100%;height:175px;object-fit:cover;border-radius:10px;margin-bottom:12px;">{% endif %}
+                <h3 style="font-family:'Cinzel',serif;color:var(--gold);">{{ p['name'] or p['product_name'] }}</h3>
+            </div>
+            <div><div class="price">₹{{ p['price'] }} / {{ p['unit'] }}</div><a href="{{ url_for('cust_product_detail', pid=p['id']) }}" class="btn" style="width:100%;background:#181818;">Details</a></div>
+        </div>
+        {% endfor %}
+    </div>
+    """, products=products, q=q, secret_matched=secret_matched)
+
+
+@app.route("/product/<int:pid>")
+def cust_product_detail(pid):
+    con = get_db()
+    product = con.execute("SELECT * FROM products WHERE id=?", (pid,)).fetchone()
+    con.close()
+    if not product:
+        flash("Product not found.")
+        return redirect(url_for("cust_home"))
+    return render_store("""
+    <div class="card">
+        <div style="display:grid;grid-template-columns:1fr 1.4fr;gap:26px;">
+            <div>{% if product['image'] %}<img src="{{ url_for('uploaded_file', filename=product['image']) }}" style="width:100%;max-height:380px;object-fit:cover;border-radius:12px;">{% endif %}</div>
+            <div>
+                <span class="cat-tag">{{ product['category'] }}</span>
+                <h1 style="color:var(--gold);margin:8px 0;">{{ product['name'] or product['product_name'] }}</h1>
+                <div class="price">₹{{ product['price'] }} / {{ product['unit'] }}</div>
+                <p style="color:var(--muted);">{{ product['description'] }}</p>
+                <form method="post" action="{{ url_for('cust_add_cart', pid=product['id']) }}">
+                    <button class="btn" style="background:var(--gold);color:#0a0a0a;width:100%;margin-top:20px;">🛒 Add to Cart</button>
+                </form>
+            </div>
+        </div>
+    </div>
+    """, product=product)
+
+
+@app.post("/cart/add/<int:pid>")
+def cust_add_cart(pid):
+    cart = session.get("cart", {})
+    cart[str(pid)] = cart.get(str(pid), 0) + 1
+    session["cart"] = cart
+    flash("Product added to cart.")
+    return redirect(request.referrer or url_for("cust_home"))
+
+
+@app.route("/cart", methods=["GET", "POST"])
+def cust_cart():
+    cart = session.get("cart", {})
+    if request.method == "POST":
+        pid = request.form.get("pid")
+        action = request.form.get("action")
+        if pid in cart:
+            if action == "inc":
+                cart[pid] += 1
+            elif action == "dec":
+                cart[pid] -= 1
+                if cart[pid] <= 0:
+                    del cart[pid]
+            elif action == "remove":
+                del cart[pid]
+        session["cart"] = cart
+        return redirect(url_for("cust_cart"))
+    con = get_db()
+    items = []
+    subtotal = 0
+    for pid_str, qty in cart.items():
+        p = con.execute("SELECT * FROM products WHERE id=?", (int(pid_str),)).fetchone()
+        if p:
+            line = float(p["price"]) * qty
+            subtotal += line
+            items.append({"product": p, "qty": qty, "line_total": line})
+    con.close()
+    return render_store("""
+    <h1 style="font-family:'Cinzel',serif;color:var(--gold);">Cart</h1>
+    {% if items %}
+    <table>
+        <tr><th>Product</th><th>Price</th><th>Qty</th><th>Subtotal</th><th>Action</th></tr>
+        {% for it in items %}
+        <tr>
+            <td><b>{{ it['product']['name'] or it['product']['product_name'] }}</b></td>
+            <td>₹{{ it['product']['price'] }}</td>
+            <td>
+                <form method="post" style="display:inline;">
+                    <input type="hidden" name="pid" value="{{ it['product']['id'] }}">
+                    <button name="action" value="dec" class="btn" style="padding:4px 10px;background:#181818;">-</button>
+                    <b style="margin:0 8px;">{{ it['qty'] }}</b>
+                    <button name="action" value="inc" class="btn" style="padding:4px 10px;background:#181818;">+</button>
+                </form>
+            </td>
+            <td><b>₹{{ it['line_total'] }}</b></td>
+            <td>
+                <form method="post" style="display:inline;">
+                    <input type="hidden" name="pid" value="{{ it['product']['id'] }}">
+                    <button name="action" value="remove" class="btn" style="padding:4px 10px;background:var(--red);">Remove</button>
+                </form>
+            </td>
+        </tr>
+        {% endfor %}
+    </table>
+    <div class="card" style="margin-top:20px;text-align:right;">
+        <h3 style="color:var(--gold);">Total: ₹{{ subtotal }}</h3>
+        <a href="{{ url_for('cust_checkout') }}" class="btn" style="background:var(--gold);color:#0a0a0a;">Proceed to Checkout & Payment Portal →</a>
+    </div>
+    {% else %}
+    <div class="card"><p>Your cart is empty.</p></div>
+    {% endif %}
+    """, items=items, subtotal=subtotal)
+
+
+@app.route("/checkout", methods=["GET", "POST"])
+def cust_checkout():
+    cart = session.get("cart", {})
+    if not cart:
+        return redirect(url_for("cust_products"))
+    con = get_db()
+    items = []
+    total = 0
+    for pid_str, qty in cart.items():
+        p = con.execute("SELECT * FROM products WHERE id=?", (int(pid_str),)).fetchone()
+        if p:
+            line = float(p["price"]) * qty
+            total += line
+            items.append({"product": p, "qty": qty, "line_total": line})
+
+    payment_settings = dict(con.execute("SELECT key, value FROM settings WHERE key IN ('upi_id', 'scanner_image')").fetchall())
+    con.close()
+
+    upi_id = payment_settings.get("upi_id", "r39446772@okicici")
+    scanner_image = payment_settings.get("scanner_image", "")
+
+    courier_sources = [
+        "India Post Speed Post", "VRL Logistics Express", "DTDC Surface Cargo", "Delhivery Heavy Freight",
+        "Blue Dart Air Express", "XpressBees Surface", "Ecom Express B2C", "Shadowfax LastMile",
+        "Ekart Logistics Hub", "Gati KWE Cargo", "Professional Couriers", "Safe Express Cargo",
+        "Overnite Express", "Trackon Couriers", "First Flight Couriers", "ST Couriers",
+        "Amazon Transportation Services", "Rivigo Logistics", "FedEx Express India", "DHL Express Surface"
+    ]
+
+    if request.method == "POST":
+        cname = request.form.get("customer_name")
+        cphone = request.form.get("customer_phone")
+        address = request.form.get("address")
+        courier_source = request.form.get("courier_source")
+        upi_utr = request.form.get("upi_utr", "").strip()
+
+        if not upi_utr:
+            flash("UPI Transaction ID / UTR Number is mandatory before approving and placing the order.")
+            return redirect(url_for("cust_checkout"))
+
+        payment_mode = "UPI / QR Code"
+        payment_status = f"Paid via UPI ({upi_id}) | UTR: {upi_utr}"
+
+        summary = ", ".join([f"{it['product']['name']} (x{it['qty']})" for it in items])
+        first_p = items[0]["product"]
+
+        con = get_db()
+        cur = con.execute("""
+            INSERT INTO orders(customer_name, customer_phone, phone, address, courier_source, items_summary, product_name, product_id, quantity, total, payment_mode, upi_utr, payment_status, order_status, status, created_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            cname, cphone, cphone, address, courier_source, summary, first_p["name"],
+            first_p["id"], sum(cart.values()), total, payment_mode, upi_utr,
+            payment_status, 'Pending', 'Pending', datetime.now().isoformat()
+        ))
+        oid = cur.lastrowid
+        con.commit()
+        con.close()
+        session["cart"] = {}
+        session["customer_phone"] = cphone
+        my_ids = session.get("my_order_ids", [])
+        if oid not in my_ids:
+            my_ids.append(oid)
+        session["my_order_ids"] = my_ids
+        flash(f"✅ Order #{oid} booked successfully! Saved in your My Orders section.")
+        return redirect(url_for("cust_my_orders"))
+
+    return render_store("""
+    <h1 style="font-family:'Cinzel',serif;color:var(--gold);">Checkout & UPI Secure Payment</h1>
+    <div class="card" style="max-width:740px;margin:0 auto;">
+        <form method="post">
+            <h3 style="color:var(--gold);margin-top:0;">1. Shipping Address & Courier Source</h3>
+            <label>Full Name</label><input name="customer_name" required placeholder="Enter full name">
+            <label>Mobile Number</label><input name="customer_phone" required placeholder="Enter mobile number">
+            <label>Delivery Address</label><textarea name="address" required placeholder="Full street address with landmark..."></textarea>
+
+            <label>Select Courier Source Network</label>
+            <select name="courier_source" required style="border:2px solid var(--gold);font-weight:600;">
+                {% for cs in courier_sources %}
+                <option value="{{ cs }}">{{ cs }}</option>
+                {% endfor %}
+            </select>
+
+            <h3 style="color:var(--gold);margin-top:24px;">2. Payment Method (UPI / QR Code Only)</h3>
+            <div style="background:#141414;padding:20px;border-radius:10px;border:1px solid var(--gold);margin-bottom:20px;text-align:center;">
+                {% if scanner_image %}
+                <img src="{{ url_for('uploaded_file', filename=scanner_image) }}" style="max-width:220px;border-radius:10px;border:2px solid var(--gold);margin-bottom:12px;">
+                {% else %}
+                <p style="color:var(--muted);">No Scanner Image Uploaded yet.</p>
+                {% endif %}
+                <p style="color:var(--gold);font-size:16px;margin:8px 0;"><b>UPI ID:</b> {{ upi_id }}</p>
+                <p style="color:var(--muted);font-size:13px;">Scan this QR code using any UPI app (Google Pay, PhonePe, Paytm, etc.) or pay directly to the UPI ID above.</p>
+                <input type="hidden" name="upi_id" value="{{ upi_id }}">
+
+                <div style="text-align:left;margin-top:18px;border-top:1px solid var(--border);padding-top:16px;">
+                    <label style="color:var(--gold);font-weight:700;">UPI Transaction ID / UTR Number (Mandatory) *</label>
+                    <input type="text" name="upi_utr" required minlength="8" placeholder="Enter 12-digit UPI Transaction ID / UTR Number after payment" style="border:2px solid var(--gold);margin-bottom:4px;">
+                    <small style="color:var(--muted);">You must enter the valid UPI Transaction ID / UTR number from your payment receipt before clicking Approve & Place Order.</small>
+                </div>
+            </div>
+
+            <div style="background:#1a1408;padding:16px;border-radius:10px;border:1px solid var(--gold);margin-bottom:20px;">
+                <p style="margin:0;color:var(--gold);"><b>Total Amount to Pay: ₹{{ total }}</b></p>
+            </div>
+
+            <button type="submit" class="btn" style="background:var(--gold);color:#0a0a0a;width:100%;padding:14px;font-size:16px;font-weight:700;">✅ Approve Payment & Place Order →</button>
+        </form>
+    </div>
+    """, total=total, courier_sources=courier_sources, upi_id=upi_id, scanner_image=scanner_image)
+
+
+@app.route("/support", methods=["GET", "POST"])
+def cust_support():
+    con = get_db()
+    if request.method == "POST":
+        cname = request.form.get("customer_name")
+        cphone = request.form.get("customer_phone")
+        subject = request.form.get("subject")
+        message = request.form.get("message")
+        con.execute(
+            "INSERT INTO support_tickets(customer_name, customer_phone, subject, message, status, created_at) VALUES(?,?,?,?,'Open',?)",
+            (cname, cphone, subject, message, datetime.now().isoformat())
+        )
+        con.commit()
+        flash("Support ticket submitted successfully! Our support team will respond shortly.")
+        return redirect(url_for("cust_support"))
+    tickets = con.execute("SELECT * FROM support_tickets ORDER BY id DESC LIMIT 10").fetchall()
+    con.close()
+    return render_store("""
+    <h1 style="font-family:'Cinzel',serif;color:var(--gold);">💬 Customer Support Center</h1>
+    <div class="card" style="max-width:740px;margin:0 auto 30px;">
+        <h3>Submit a Support Request or Inquiry</h3>
+        <form method="post">
+            <label>Your Full Name</label><input name="customer_name" required placeholder="Enter name">
+            <label>Mobile Number</label><input name="customer_phone" required placeholder="Enter phone">
+            <label>Subject / Issue Type</label>
+            <select name="subject" required>
+                <option>Order Delivery Delay</option>
+                <option>Payment Issue / Refund</option>
+                <option>Organic Product Quality Inquiry</option>
+                <option>Seller Partnership Question</option>
+                <option>General Store Inquiry</option>
+            </select>
+            <label>Detailed Message</label>
+            <textarea name="message" rows="4" required placeholder="Describe your query or issue in detail..."></textarea>
+            <button class="btn" style="background:var(--gold);color:#0a0a0a;width:100%;">Submit Support Ticket</button>
+        </form>
+    </div>
+
+    <div class="card" style="max-width:840px;margin:0 auto;">
+        <h3>Recent Support Tickets & Status</h3>
+        <table>
+            <tr><th>ID</th><th>Customer</th><th>Subject</th><th>Status</th><th>Response</th></tr>
+            {% for t in tickets %}
+            <tr>
+                <td>#{{ t['id'] }}</td>
+                <td><b>{{ t['customer_name'] }}</b><br>{{ t['customer_phone'] }}</td>
+                <td>{{ t['subject'] }}</td>
+                <td><span style="color:var(--gold);">{{ t['status'] }}</span></td>
+                <td>{{ t['admin_reply'] or 'Awaiting response...' }}</td>
+            </tr>
+            {% endfor %}
+        </table>
+    </div>
+    """, tickets=tickets)
+
+
+@app.route("/order-confirmation/<int:oid>")
+def cust_confirm(oid):
+    con = get_db()
+    order = con.execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone()
+    con.close()
+    return render_store("""
+    <div class="card" style="text-align:center;max-width:600px;margin:0 auto;">
+        <h1 style="color:var(--gold);">✅ Order Placed Successfully!</h1>
+        <p>Order ID: <b>#{{ order['id'] }}</b></p>
+        <p>Payment Mode: <b>{{ order['payment_mode'] }}</b></p>
+        <p>UPI Transaction ID (UTR): <b style="color:var(--gold);">{{ order['upi_utr'] }}</b></p>
+        <p>Payment Status: <span style="color:#10b981;font-weight:700;">{{ order['payment_status'] }}</span></p>
+        <p>Selected Courier Network Source: <b>{{ order['courier_source'] }}</b></p>
+        <div style="display:flex;gap:12px;justify-content:center;margin-top:16px;">
+            <a href="{{ url_for('cust_my_orders') }}" class="btn" style="background:var(--gold);color:#0a0a0a;">📦 Go to My Orders</a>
+            <a href="{{ url_for('cust_track', oid=order['id']) }}" class="btn" style="background:#181818;">Track Order Status</a>
+        </div>
+    </div>
+    """, order=order)
+
+
+@app.route("/track")
+def cust_track():
+    oid = request.args.get("oid", "").strip()
+    order = None
+    if oid.isdigit():
+        con = get_db()
+        order = con.execute("SELECT * FROM orders WHERE id=?", (int(oid),)).fetchone()
+        con.close()
+    return render_store("""
+    <h1 style="font-family:'Cinzel',serif;color:var(--gold);">Track Order & Delivery</h1>
+    <div class="card" style="max-width:600px;">
+        <form method="get" style="display:flex;gap:10px;">
+            <input name="oid" placeholder="Enter Order ID" value="{{ oid }}" required style="margin:0;">
+            <button class="btn">Track</button>
+        </form>
+        {% if order %}
+        <div style="margin-top:20px;">
+            <h3>Order #{{ order['id'] }} Status: {{ order['order_status'] or order['status'] }}</h3>
+            <p><b>Payment Mode:</b> {{ order['payment_mode'] }} | <b>UTR:</b> {{ order['upi_utr'] or 'N/A' }}</p>
+            <p><b>Payment Status:</b> {{ order['payment_status'] }}</p>
+            <p><b>Courier Source Network:</b> {{ order['courier_source'] }}</p>
+            {% if order['courier_name'] %}
+            <div style="padding:14px;background:#142214;border:1px solid var(--gold);border-radius:8px;margin-top:10px;">
+                <p><b>Assigned Courier Service:</b> {{ order['courier_name'] }}</p>
+                <p><b>Tracking ID / Waybill:</b> {{ order['tracking_id'] }}</p>
+                <p style="color:#10b981;margin-bottom:0;">{{ order['seller_dispatch_msg'] }}</p>
+            </div>
+            {% endif %}
+        </div>
+        {% endif %}
+    </div>
+    """, order=order, oid=oid)
+
+
+@app.route("/my-orders", methods=["GET", "POST"])
+def cust_my_orders():
+    if request.method == "POST":
+        phone_input = request.form.get("customer_phone", "").strip()
+        if phone_input:
+            session["customer_phone"] = phone_input
+            return redirect(url_for("cust_my_orders"))
+
+    phone_query = request.args.get("phone", "").strip()
+    if phone_query:
+        session["customer_phone"] = phone_query
+
+    saved_phone = session.get("customer_phone", "")
+    saved_ids = session.get("my_order_ids", [])
+
+    con = get_db()
+    orders = []
+    if saved_phone:
+        orders = con.execute(
+            "SELECT * FROM orders WHERE customer_phone=? OR phone=? ORDER BY id DESC",
+            (saved_phone, saved_phone)
+        ).fetchall()
+    elif saved_ids:
+        placeholders = ",".join("?" for _ in saved_ids)
+        orders = con.execute(
+            f"SELECT * FROM orders WHERE id IN ({placeholders}) ORDER BY id DESC",
+            tuple(saved_ids)
+        ).fetchall()
+    con.close()
+
+    return render_store("""
+    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;margin-bottom:20px;">
+        <h1 style="font-family:'Cinzel',serif;color:var(--gold);margin:0;">📦 My Orders & Live Tracking</h1>
+        <form method="post" style="display:flex;gap:8px;align-items:center;margin:0;max-width:420px;width:100%;">
+            <input type="text" name="customer_phone" value="{{ saved_phone }}" placeholder="Enter Mobile Number to load all orders..." required style="margin:0;padding:10px 14px;">
+            <button type="submit" class="btn" style="padding:10px 16px;white-space:nowrap;">Find Orders</button>
+        </form>
+    </div>
+
+    {% if orders %}
+    <div style="display:grid;gap:18px;">
+        {% for o in orders %}
+        {% set st = (o['order_status'] or o['status'] or 'Pending') %}
+        <div class="card" style="border:1px solid {{ '#ef4444' if st=='Rejected' else ('#10b981' if st in ['Shipped', 'Delivered', 'Approved'] else 'var(--gold)') }};">
+            <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px;border-bottom:1px solid var(--border);padding-bottom:14px;margin-bottom:14px;">
+                <div>
+                    <span style="font-family:'Cinzel',serif;font-size:20px;font-weight:700;color:var(--gold);">Order #{{ o['id'] }}</span>
+                    <span style="color:var(--muted);font-size:13px;margin-left:10px;">Booked on: {{ (o['created_at'] or '')[:16].replace('T', ' ') }}</span>
+                    <div style="margin-top:6px;font-size:15px;"><b>Items:</b> {{ o['items_summary'] or o['product_name'] }}</div>
+                </div>
+                <div style="text-align:right;">
+                    <div style="font-family:'Cinzel',serif;font-size:20px;font-weight:700;color:var(--gold);">₹{{ o['total'] }}</div>
+                    {% if st == 'Rejected' %}
+                        <span style="display:inline-block;margin-top:6px;background:#7f1d1d;color:#fecaca;border:1px solid #ef4444;padding:5px 12px;border-radius:20px;font-size:12px;font-weight:700;">❌ Order Rejected</span>
+                    {% elif st in ['Shipped', 'Delivered'] %}
+                        <span style="display:inline-block;margin-top:6px;background:#064e3b;color:#a7f3d0;border:1px solid #10b981;padding:5px 12px;border-radius:20px;font-size:12px;font-weight:700;">🚚 {{ st }}</span>
+                    {% else %}
+                        <span style="display:inline-block;margin-top:6px;background:#451a03;color:#fde68a;border:1px solid var(--gold);padding:5px 12px;border-radius:20px;font-size:12px;font-weight:700;">⏳ {{ st }}</span>
+                    {% endif %}
+                </div>
+            </div>
+
+            {% if st == 'Rejected' %}
+            <div style="background:#2a0a0a;border:1px solid #ef4444;border-left:5px solid #ef4444;padding:14px 16px;border-radius:8px;margin-bottom:14px;">
+                <div style="color:#fca5a5;font-weight:700;font-size:14px;margin-bottom:4px;">⚠️ Order Rejected — Reason:</div>
+                <div style="color:#ffffff;font-size:15px;">{{ o['rejection_reason'] or 'No specific reason provided. Please contact Customer Support.' }}</div>
+            </div>
+            {% endif %}
+
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;font-size:13.5px;color:var(--muted);">
+                <div><b style="color:var(--text);">Customer:</b> {{ o['customer_name'] }} ({{ o['customer_phone'] }})</div>
+                <div><b style="color:var(--text);">Payment Mode:</b> {{ o['payment_mode'] }} | <b style="color:var(--gold);">UTR:</b> {{ o['upi_utr'] or 'N/A' }}</div>
+                <div><b style="color:var(--text);">Preferred Courier:</b> {{ o['courier_source'] or 'Standard' }}</div>
+                <div><b style="color:var(--text);">Delivery Address:</b> {{ o['address'] }}</div>
+            </div>
+
+            {% if o['courier_name'] and st != 'Rejected' %}
+            <div style="padding:14px;background:#102216;border:1px solid #10b981;border-radius:8px;margin-top:14px;">
+                <div style="color:#10b981;font-weight:700;margin-bottom:4px;">🚚 Courier Dispatched & Tracking Details</div>
+                <div style="font-size:14px;"><b>Courier Service:</b> {{ o['courier_name'] }} &nbsp;|&nbsp; <b>Tracking ID / Waybill:</b> <span style="color:var(--gold);font-weight:700;">{{ o['tracking_id'] }}</span></div>
+                {% if o['seller_dispatch_msg'] %}<div style="font-size:13px;color:#a7f3d0;margin-top:4px;">{{ o['seller_dispatch_msg'] }}</div>{% endif %}
+            </div>
+            {% endif %}
+        </div>
+        {% endfor %}
+    </div>
+    {% else %}
+    <div class="card" style="text-align:center;padding:40px 20px;">
+        <h3 style="color:var(--gold);margin-top:0;">No Orders Found Yet</h3>
+        <p style="color:var(--muted);max-width:500px;margin:0 auto 20px;">Book a product from our store or enter your registered mobile number above to view and track your orders.</p>
+        <a href="{{ url_for('cust_products') }}" class="btn" style="background:var(--gold);color:#0a0a0a;">Browse Organic Products →</a>
+    </div>
+    {% endif %}
+    """, orders=orders, saved_phone=saved_phone)
+
+
+# ==============================================================================
+# 2. SELLER PORTAL (/seller)
+# ==============================================================================
+
+def render_seller(body, **ctx):
+    sname = session.get("seller_name")
+    theme_color, _ = get_theme()
+    shell = """
+    <!doctype html>
+    <html lang="en">
+    <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>ROYAL RICES — Seller Portal</title>
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Cinzel:wght@600;700;800&family=Montserrat:wght@400;500;600;700&display=swap');
+    :root{--bg:#0f0f0f;--card:#181818;--gold:#d4af37;--gold-light:#f3e5ab;--red:__THEME_COLOR__;--red-bright:#ff2400;--text:#f5f5f5;--muted:#b0b0b0;--border:#333333;}
+    *{box-sizing:border-box}
+    body{margin:0;background:var(--bg);color:var(--text);font-family:'Montserrat', sans-serif;min-height:100vh;}
+    header{background:linear-gradient(135deg, #0a0a0a, #1a0505);padding:20px 32px;display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;border-bottom:3px solid var(--gold);}
+    nav{background:#141414;padding:12px 28px;display:flex;flex-wrap:wrap;gap:8px;border-bottom:1px solid var(--border);}
+    nav a{color:var(--muted);text-decoration:none;padding:9px 14px;border-radius:6px;font-weight:600;}
+    nav a:hover{background:var(--red);color:var(--gold-light);border:1px solid var(--gold);}
+    .wrap{max-width:1200px;margin:28px auto;padding:0 20px;}
+    h1,h2,h3{font-family:'Cinzel',serif;color:var(--gold);}
+    .card{background:var(--card);border-radius:14px;padding:24px;margin-bottom:22px;border:1px solid var(--border);}
+    input,select,textarea{width:100%;padding:12px;background:#0d0d0d;border:1px solid var(--border);border-radius:8px;color:var(--text);margin:6px 0 16px;}
+    .btn{display:inline-block;padding:11px 18px;border-radius:8px;border:1px solid var(--gold);background:var(--red);color:var(--gold-light);text-decoration:none;font-weight:600;cursor:pointer;}
+    .btn:hover{background:var(--gold);color:#0a0a0a;}
+    table{width:100%;border-collapse:collapse;background:#141414;border-radius:10px;overflow:hidden;}
+    th,td{padding:14px;border-bottom:1px solid var(--border);text-align:left;}
+    th{background:#1e1e1e;color:var(--gold);font-family:'Cinzel',serif;}
+    .flash{background:#1c1313;border-left:5px solid var(--red-bright);border:1px solid var(--border);color:var(--gold-light);padding:14px;border-radius:8px;margin-bottom:20px;font-weight:600;}
+    </style>
+    </head>
+    <body>
+    <header>
+        <div style="font-size:22px;font-family:'Cinzel',serif;color:var(--gold);">🌱 ROYAL RICES — SELLER PORTAL</div>
+        <div style="display:flex;gap:12px;align-items:center;">
+            <a href="{{ url_for('cust_home') }}" style="color:var(--gold);border:1px solid var(--gold);padding:6px 12px;border-radius:6px;text-decoration:none;">Store Home</a>
+            {% if sname %}<span>Welcome, <b>{{ sname }}</b></span> | <a href="{{ url_for('seller_logout') }}" style="color:var(--gold);">Logout</a>{% endif %}
+        </div>
+    </header>
+    {% if sname %}
+    <nav>
+        <a href="{{ url_for('seller_dashboard') }}">Dashboard</a>
+        <a href="{{ url_for('seller_add_product') }}">+ Submit Product (Category Selection)</a>
+        <a href="{{ url_for('seller_my_products') }}">My Products & Status</a>
+        <a href="{{ url_for('seller_dispatch') }}">🚚 Dispatch & Courier Instructions</a>
+    </nav>
+    {% endif %}
+    <main class="wrap">
+    {% with ms=get_flashed_messages() %}
+    {% for m in ms %}<div class="flash">{{m}}</div>{% endfor %}
+    {% endwith %}
+    {{ content|safe }}
+    </main>
+    </body>
+    </html>
+    """.replace("__THEME_COLOR__", theme_color)
+    return render_template_string(shell, sname=sname, content=render_template_string(body, **ctx))
+
+
+@app.route("/seller", methods=["GET", "POST"])
+@app.route("/seller/login", methods=["GET", "POST"])
+def seller_login():
+    if "seller_id" in session:
+        return redirect(url_for("seller_dashboard"))
+    if request.method == "POST":
+        phone = request.form.get("phone", "").strip()
+        con = get_db()
+        seller = con.execute("SELECT * FROM sellers WHERE phone=?", (phone,)).fetchone()
+        con.close()
+        if seller:
+            session["seller_id"] = seller["id"]
+            session["seller_name"] = seller["business_name"] or seller["name"]
+            return redirect(url_for("seller_dashboard"))
+        flash("Seller not found. Please register first.")
+    return render_seller("""
+    <div style="max-width:440px;margin:30px auto;" class="card">
+        <h2>Seller Login</h2>
+        <form method="post">
+            <label>Mobile Number</label><input name="phone" required placeholder="Enter mobile number">
+            <button class="btn" style="width:100%;">Login</button>
+        </form>
+        <p style="margin-top:16px;text-align:center;"><a href="{{ url_for('seller_register') }}" style="color:var(--gold);">Register New Seller</a></p>
+    </div>
+    """)
+
+
+@app.route("/seller/register", methods=["GET", "POST"])
+def seller_register():
+    if request.method == "POST":
+        name = request.form.get("name")
+        bname = request.form.get("business_name")
+        phone = request.form.get("phone")
+        email = request.form.get("email")
+        upi_id = request.form.get("upi_id")
+
+        if not upi_id:
+            flash("UPI ID is mandatory for seller registration.")
+            return redirect(url_for("seller_register"))
+
+        con = get_db()
+        try:
+            con.execute(
+                "INSERT INTO sellers(name, business_name, phone, email, upi_id, status, created_at) VALUES(?,?,?,?,?,'Pending',?)",
+                (name, bname, phone, email, upi_id, datetime.now().isoformat())
+            )
+            con.commit()
+        except Exception:
+            con.close()
+            flash("Registration failed. Mobile number might already be registered.")
+            return redirect(url_for("seller_register"))
+        con.close()
+        flash("Registration submitted successfully with UPI ID! Approval pending.")
+        return redirect(url_for("seller_login"))
+    return render_seller("""
+    <div style="max-width:480px;margin:30px auto;" class="card">
+        <h2>Seller Registration (UPI ID Mandatory)</h2>
+        <form method="post">
+            <label>Full Name</label><input name="name" required placeholder="Enter your full name">
+            <label>Business / Farm Name</label><input name="business_name" required placeholder="Enter business name">
+            <label>Mobile Number</label><input name="phone" required placeholder="Enter mobile number">
+            <label>Email</label><input name="email" placeholder="Enter email (optional)">
+            <label><b>UPI ID (Mandatory)</b></label><input name="upi_id" required placeholder="e.g. yourname@okicici or 9876543210@ybl">
+            <button class="btn" style="width:100%;">Register Seller Account</button>
+        </form>
+    </div>
+    """)
+
+
+@app.route("/seller/logout")
+def seller_logout():
+    session.pop("seller_id", None)
+    session.pop("seller_name", None)
+    return redirect(url_for("seller_login"))
+
+
+@app.route("/seller/dashboard")
+def seller_dashboard():
+    sid = session.get("seller_id")
+    if not sid:
+        return redirect(url_for("seller_login"))
+    con = get_db()
+    seller = con.execute("SELECT * FROM sellers WHERE id=?", (sid,)).fetchone()
+    total = con.execute("SELECT COUNT(*) FROM seller_products WHERE seller_id=?", (sid,)).fetchone()[0]
+    approved = con.execute("SELECT COUNT(*) FROM seller_products WHERE seller_id=? AND status='Approved'", (sid,)).fetchone()[0]
+    con.close()
+    return render_seller("""
+    <h1>Seller Dashboard</h1>
+    <div class="card">
+        <h3>Status: <span style="color:var(--gold);">{{ seller['status'] }}</span></h3>
+        <p>Business: <b>{{ seller['business_name'] }}</b> | Phone: {{ seller['phone'] }} | UPI ID: <b style="color:var(--gold);">{{ seller['upi_id'] or 'N/A' }}</b></p>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;">
+        <div class="card"><div>Products Submitted</div><div style="font-size:30px;color:var(--gold);">{{ total }}</div></div>
+        <div class="card"><div>Approved & Live in Category</div><div style="font-size:30px;color:#10b981;">{{ approved }}</div></div>
+    </div>
+    """, seller=seller, total=total, approved=approved)
+
+
+@app.route("/seller/add-product", methods=["GET", "POST"])
+def seller_add_product():
+    sid = session.get("seller_id")
+    if not sid:
+        return redirect(url_for("seller_login"))
+    con = get_db()
+    seller = con.execute("SELECT status FROM sellers WHERE id=?", (sid,)).fetchone()
+    cats = con.execute("SELECT name FROM categories WHERE COALESCE(active,1)=1").fetchall()
+    top_couriers = ["India Post", "VRL Logistics", "DTDC Courier", "Blue Dart Express", "Delhivery", "XpressBees", "Ecom Express", "Shadowfax", "Ekart Logistics", "Gati KWE"]
+
+    if request.method == "POST":
+        if seller["status"] != "Approved":
+            flash("Your seller account must be Approved before submitting products.")
+            con.close()
+            return redirect(url_for("seller_dashboard"))
+        photo = request.files.get("product_photo")
+        filename = ""
+        if photo and photo.filename:
+            filename = f"prod_{sid}_{int(time.time())}_{secure_filename(photo.filename)}"
+            photo.save(UPLOAD_DIR / filename)
+
+        con.execute("""
+            INSERT INTO seller_products(
+                seller_id, product_name, category, description, price, unit, stock, image,
+                origin, farming_method, processing_info, storage_details, certification,
+                product_type, organic_tier, courier_1, courier_2, delivery_days, status, created_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            sid, request.form.get("product_name"), request.form.get("category"), request.form.get("description"),
+            float(request.form.get("price", 0)), request.form.get("unit", "1 kg"), int(request.form.get("stock", 0)),
+            filename, request.form.get("origin"), request.form.get("farming_method"), request.form.get("processing_info"),
+            request.form.get("storage_details"), request.form.get("certification"),
+            request.form.get("product_type", "Finished Product"), request.form.get("organic_tier", "High Organic Premium Grade"),
+            request.form.get("courier_1", "India Post"), request.form.get("courier_2", "VRL Logistics"),
+            request.form.get("delivery_days", "4-7 Days"), 'Pending', datetime.now().isoformat()
+        ))
+        con.commit()
+        con.close()
+        flash("Product submitted successfully! Upon approval, it will appear live in the selected category.")
+        return redirect(url_for("seller_my_products"))
+    con.close()
+    return render_seller("""
+    <h1>Submit Product (Select Category for Website Display)</h1>
+    <div class="card">
+        <form method="post" enctype="multipart/form-data">
+            <label>1. Upload Product Photo</label>
+            <input type="file" name="product_photo" accept="image/*" required style="padding:10px;background:#0d0d0d;border:1px solid var(--border);border-radius:8px;">
+
+            <label>2. Select Category (Product will display under this category on customer store after approval)</label>
+            <select name="category" required style="border:2px solid var(--gold);font-weight:600;">
+                {% for c in cats %}<option>{{ c['name'] }}</option>{% endfor %}
+            </select>
+
+            <label>3. Product Name</label>
+            <input name="product_name" required placeholder="e.g. Organic Red Rice">
+
+            <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;">
+                <div><label>4. Price (₹)</label><input type="number" step="0.01" name="price" required placeholder="140"></div>
+                <div><label>5. Unit</label><select name="unit"><option>1 kg</option><option>500 g</option><option>250 g</option><option>100 g</option><option>1 Pack</option></select></div>
+                <div><label>6. Stock</label><input type="number" name="stock" required placeholder="50"></div>
+            </div>
+
+            <label>7. Farming / Preparation Method</label>
+            <select name="farming_method">
+                <option value="100% Zero-Chemical Natural Farming">100% Zero-Chemical Natural Farming</option>
+                <option value="Traditional Organic Compost Farming">Traditional Organic Compost Farming</option>
+                <option value="Handcrafted Home Kitchen Preparation">Handcrafted Home Kitchen Preparation</option>
+            </select>
+
+            <fieldset style="border:1px solid var(--gold);border-radius:10px;padding:16px;margin:16px 0;background:#141414;">
+                <legend style="color:var(--gold);font-weight:700;padding:0 8px;">8. Select 2 Preferred Courier Partners</legend>
+                <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;">
+                    <div><label>Courier Option 1</label><select name="courier_1">{% for tc in top_couriers %}<option>{{ tc }}</option>{% endfor %}</select></div>
+                    <div><label>Courier Option 2</label><select name="courier_2">{% for tc in top_couriers %}<option {{ 'selected' if tc=='VRL Logistics' else '' }}>{{ tc }}</option>{% endfor %}</select></div>
+                    <div><label>Delivery Days</label><select name="delivery_days"><option>4-7 Days</option><option>3-5 Days</option></select></div>
+                </div>
+            </fieldset>
+
+            <label>9. Origin & Certification</label>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+                <input name="origin" required placeholder="e.g. Mysuru, Karnataka">
+                <select name="certification"><option>NPOP / India Organic Certified</option><option>FSSAI Home Kitchen</option></select>
+            </div>
+
+            <label>10. Description / Highlights</label>
+            <textarea name="description" rows="3" required placeholder="Describe purity, taste, aroma..."></textarea>
+
+            <button class="btn" style="background:var(--gold);color:#0a0a0a;width:100%;padding:14px;font-size:16px;">✅ Submit Product</button>
+        </form>
+    </div>
+    """, cats=cats, top_couriers=top_couriers)
+
+
+@app.route("/seller/my-products")
+def seller_my_products():
+    sid = session.get("seller_id")
+    if not sid:
+        return redirect(url_for("seller_login"))
+    con = get_db()
+    rows = con.execute("SELECT * FROM seller_products WHERE seller_id=? ORDER BY id DESC", (sid,)).fetchall()
+    con.close()
+    return render_seller("""
+    <h1>My Products & Status</h1>
+    <div class="card">
+        <table>
+            <tr><th>ID</th><th>Photo</th><th>Product & Category</th><th>Price & Stock</th><th>Status</th><th>Note</th></tr>
+            {% for r in rows %}
+            <tr>
+                <td>#{{ r['id'] }}</td>
+                <td>{% if r['image'] %}<img src="{{ url_for('uploaded_file', filename=r['image']) }}" style="width:55px;height:55px;object-fit:cover;border-radius:6px;">{% endif %}</td>
+                <td><b>{{ r['product_name'] }}</b><br><span style="color:var(--gold);font-weight:600;">Category: {{ r['category'] }}</span></td>
+                <td>₹{{ r['price'] }} / {{ r['unit'] }}<br><small>Stock: {{ r['stock'] }}</small></td>
+                <td><b>{{ r['status'] }}</b></td>
+                <td>{{ r['admin_note'] or 'None' }}</td>
+            </tr>
+            {% endfor %}
+        </table>
+    </div>
+    """, rows=rows)
+
+
+@app.route("/seller/dispatch-orders")
+def seller_dispatch():
+    sid = session.get("seller_id")
+    if not sid:
+        return redirect(url_for("seller_login"))
+    con = get_db()
+    orders = con.execute(
+        "SELECT o.*, p.name AS product_name FROM orders o JOIN products p ON o.product_id=p.id WHERE p.seller_id=? ORDER BY o.id DESC",
+        (sid,)
+    ).fetchall()
+    con.close()
+    return render_seller("""
+    <h1>Courier Dispatch Instructions</h1>
+    <div class="card">
+        <table>
+            <tr><th>Order ID</th><th>Product</th><th>Customer</th><th>Payment & UTR</th><th>Courier Instruction</th><th>Tracking ID</th></tr>
+            {% for o in orders %}
+            <tr>
+                <td><b>#{{ o['id'] }}</b></td>
+                <td>{{ o['items_summary'] or o['product_name'] }}</td>
+                <td><b>{{ o['customer_name'] }}</b><br>{{ o['address'] }}</td>
+                <td>{{ o['payment_mode'] }}<br><small style="color:var(--gold);">UTR: {{ o['upi_utr'] or 'N/A' }}</small><br><span style="color:#10b981;">{{ o['payment_status'] }}</span></td>
+                <td>
+                    {% if o['seller_dispatch_msg'] %}
+                        <div style="padding:10px;background:#142214;border:1px solid #10b981;border-radius:6px;color:#10b981;">{{ o['seller_dispatch_msg'] }}</div>
+                    {% else %}
+                        <span style="color:var(--muted);">Awaiting Approval</span>
+                    {% endif %}
+                </td>
+                <td><b>{{ o['tracking_id'] or 'Pending' }}</b></td>
+            </tr>
+            {% endfor %}
+        </table>
+    </div>
+    """, orders=orders)
+
+
+# ==============================================================================
+# 3. PRIVATE CONTROL PORTAL (/admin — ONLY ACCESSIBLE VIA SECRET CODE SEARCH)
+# ==============================================================================
+
+def render_admin(body, **ctx):
+    theme_color, _ = get_theme()
+    shell = """
+    <!doctype html>
+    <html lang="en">
+    <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>ROYAL RICES — Master Control Center</title>
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Cinzel:wght@600;700;800&family=Montserrat:wght@400;500;600;700&display=swap');
+    :root{--bg:#0f0f0f;--card:#181818;--gold:#d4af37;--gold-light:#f3e5ab;--theme:__THEME_COLOR__;--theme-bright:#ff3b30;--text:#f5f5f5;--muted:#b0b0b0;--border:#333333;}
+    *{box-sizing:border-box}
+    body{margin:0;background:var(--bg);color:var(--text);font-family:'Montserrat', sans-serif;min-height:100vh;}
+    header{background:linear-gradient(135deg, #0a0a0a, #1a0505);padding:22px 32px;display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;border-bottom:3px solid var(--gold);}
+    nav{background:#141414;padding:12px 28px;display:flex;flex-wrap:wrap;gap:8px;border-bottom:1px solid var(--border);}
+    nav a{color:var(--muted);text-decoration:none;padding:9px 14px;border-radius:6px;font-weight:600;}
+    nav a:hover{background:var(--theme);color:var(--gold-light);border:1px solid var(--gold);}
+    .wrap{max-width:1320px;margin:28px auto;padding:0 20px;}
+    h1,h2,h3{font-family:'Cinzel', serif;color:var(--gold);}
+    .card{background:var(--card);border-radius:14px;padding:24px;margin-bottom:22px;border:1px solid var(--border);}
+    table{border-collapse:collapse;width:100%;background:#141414;border-radius:10px;overflow:hidden;}
+    th,td{padding:14px;border-bottom:1px solid var(--border);text-align:left;}
+    th{background:#1e1e1e;color:var(--gold);font-family:'Cinzel',serif;}
+    input,select,textarea{width:100%;padding:12px;border:1px solid var(--border);border-radius:8px;margin:6px 0 16px;background:#0d0d0d;color:var(--text);}
+    .btn{display:inline-block;border:1px solid var(--gold);border-radius:8px;padding:10px 18px;background:var(--theme);color:var(--gold-light);text-decoration:none;font-weight:600;cursor:pointer;}
+    .btn:hover{background:var(--gold);color:#0a0a0a;}
+    .flash{background:#1c1313;border-left:5px solid var(--theme-bright);border:1px solid var(--border);color:var(--gold-light);padding:14px;border-radius:8px;margin-bottom:20px;font-weight:600;}
+    </style>
+    </head>
+    <body>
+    <header>
+        <div style="font-family:'Cinzel',serif;font-size:26px;font-weight:700;color:var(--gold);">🌾 ROYAL RICES — Master Control Center</div>
+        <div style="display:flex;gap:12px;flex-wrap:wrap;">
+            <a href="{{ url_for('cust_home') }}" style="color:var(--gold);border:1px solid var(--gold);padding:6px 12px;border-radius:6px;text-decoration:none;">Store Home</a>
+            <a href="{{ url_for('seller_login') }}" style="color:var(--gold);border:1px solid var(--gold);padding:6px 12px;border-radius:6px;text-decoration:none;">Seller Portal</a>
+            <a href="{{ url_for('admin_lock') }}" style="color:#fca5a5;border:1px solid #ef4444;padding:6px 12px;border-radius:6px;text-decoration:none;">Lock Session</a>
+        </div>
+    </header>
+    <nav>
+        <a href="{{ url_for('admin_dashboard') }}">Dashboard</a>
+        <a href="{{ url_for('admin_sellers') }}">Manage Sellers</a>
+        <a href="{{ url_for('admin_seller_products') }}">Product Approvals & Inspector</a>
+        <a href="{{ url_for('admin_manual_add') }}">+ Manual Product Injector</a>
+        <a href="{{ url_for('admin_store_products') }}">Store Products Control</a>
+        <a href="{{ url_for('admin_orders') }}">Orders & Courier</a>
+        <a href="{{ url_for('admin_support') }}">💬 Support Tickets</a>
+        <a href="{{ url_for('admin_reports') }}">📊 Reports & CSV</a>
+        <a href="{{ url_for('admin_announcements') }}">📢 Ads & Banners</a>
+        <a href="{{ url_for('admin_ad_telecast') }}" style="color:var(--gold);border:1px solid var(--gold);">📺 Ad Telecast (5 Slots)</a>
+        <a href="{{ url_for('admin_theme_settings') }}" style="color:var(--gold);border:1px solid var(--gold);">🎨 App Theme Settings</a>
+        <a href="{{ url_for('admin_payment_settings') }}" style="color:var(--gold);border:1px solid var(--gold);">💳 Payment Settings</a>
+        <a href="{{ url_for('admin_update_guide') }}">⚙️ Update Guide</a>
+    </nav>
+    <main class="wrap">
+    {% with ms=get_flashed_messages() %}
+    {% for m in ms %}<div class="flash">{{m}}</div>{% endfor %}
+    {% endwith %}
+    {{ content|safe }}
+    </main>
+    </body>
+    </html>
+    """.replace("__THEME_COLOR__", theme_color)
+    return render_template_string(shell, content=render_template_string(body, **ctx))
+
+
+@app.route("/admin/lock")
+@admin_guard
+def admin_lock():
+    session.pop("admin_unlocked", None)
+    return redirect(url_for("cust_home"))
+
+
+@app.route("/admin")
+@app.route("/admin/")
+@admin_guard
+def admin_dashboard():
+    con = get_db()
+    pc = con.execute("SELECT COUNT(*) FROM products WHERE COALESCE(visible,1)=1").fetchone()[0]
+    pp = con.execute("SELECT COUNT(*) FROM seller_products WHERE LOWER(COALESCE(status,''))='pending'").fetchone()[0]
+    ps = con.execute("SELECT COUNT(*) FROM sellers").fetchone()[0]
+    po = con.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
+    pt = con.execute("SELECT COUNT(*) FROM support_tickets WHERE status='Open'").fetchone()[0]
+    con.close()
+    return render_admin("""
+    <h1>Master Control Dashboard</h1>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:18px;margin-bottom:30px;">
+        <div class="card"><h3>Live Store Products</h3><div style="font-size:32px;color:var(--gold);">{{pc}}</div><a href="{{ url_for('admin_store_products') }}" class="btn" style="margin-top:12px;padding:6px 12px;font-size:13px;">Manage Store</a></div>
+        <div class="card"><h3>Pending Approvals</h3><div style="font-size:32px;color:var(--gold);">{{pp}}</div><a href="{{ url_for('admin_seller_products') }}" class="btn" style="margin-top:12px;padding:6px 12px;font-size:13px;">Review & Approve</a></div>
+        <div class="card"><h3>Manual Injector</h3><div style="font-size:32px;color:var(--gold);">+ Add</div><a href="{{ url_for('admin_manual_add') }}" class="btn" style="margin-top:12px;padding:6px 12px;font-size:13px;">Directly Add Item</a></div>
+        <div class="card"><h3>Total Orders</h3><div style="font-size:32px;color:var(--gold);">{{po}}</div><a href="{{ url_for('admin_orders') }}" class="btn" style="margin-top:12px;padding:6px 12px;font-size:13px;">Manage Orders</a></div>
+        <div class="card"><h3>Theme Settings</h3><div style="font-size:32px;color:var(--gold);">🎨</div><a href="{{ url_for('admin_theme_settings') }}" class="btn" style="margin-top:12px;padding:6px 12px;font-size:13px;">Change Theme Color</a></div>
+    </div>
+    """, pc=pc, pp=pp, ps=ps, po=po, pt=pt)
+
+
+@app.route("/admin/theme-settings", methods=["GET", "POST"])
+@admin_guard
+def admin_theme_settings():
+    if request.method == "POST":
+        color = request.form.get("theme_color", "#8b0000")
+        name = request.form.get("theme_name", "Custom Theme")
+        con = get_db()
+        con.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('theme_color', ?)", (color,))
+        con.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('theme_name', ?)", (name,))
+        con.commit()
+        con.close()
+        flash("App theme color updated successfully across all portals!")
+        return redirect(url_for("admin_theme_settings"))
+
+    theme_color, theme_name = get_theme()
+    return render_admin("""
+    <h1>🎨 App Theme & Color Settings</h1>
+    <div class="card" style="max-width:650px;">
+        <p style="color:var(--muted);margin-bottom:18px;">Select your preferred color preset (Red, Green, Blue, Purple, etc.) or enter any custom Hex code. Changes apply immediately across Admin, Customer, and Seller portals.</p>
+        <form method="post">
+            <label>Select Theme Preset / Color</label>
+            <select name="theme_color" onchange="document.getElementById('customColor').value = this.value;" style="font-weight:600;">
+                <option value="#8b0000" {{ 'selected' if theme_color=='#8b0000' else '' }}>Royal Red (Default Red)</option>
+                <option value="#15803d" {{ 'selected' if theme_color=='#15803d' else '' }}>Emerald Green</option>
+                <option value="#1d4ed8" {{ 'selected' if theme_color=='#1d4ed8' else '' }}>Royal Blue</option>
+                <option value="#7e22ce" {{ 'selected' if theme_color=='#7e22ce' else '' }}>Deep Purple</option>
+                <option value="#b45309" {{ 'selected' if theme_color=='#b45309' else '' }}>Warm Amber</option>
+                <option value="#0f766e" {{ 'selected' if theme_color=='#0f766e' else '' }}>Teal Accent</option>
+            </select>
+
+            <label>Custom Hex Color Code</label>
+            <input type="text" name="theme_color" id="customColor" value="{{ theme_color }}" required>
+
+            <label>Theme Display Name</label>
+            <input type="text" name="theme_name" value="{{ theme_name }}" required>
+
+            <button class="btn" style="width:100%;padding:14px;font-size:16px;margin-top:10px;">💾 Save Theme Settings & Apply Live</button>
+        </form>
+    </div>
+    """, theme_color=theme_color, theme_name=theme_name)
+
+
+@app.route("/admin/manual-add", methods=["GET", "POST"])
+@admin_guard
+def admin_manual_add():
+    con = get_db()
+    cats = con.execute("SELECT name FROM categories WHERE COALESCE(active,1)=1").fetchall()
+    if request.method == "POST":
+        pname = request.form.get("product_name")
+        category = request.form.get("category")
+        price = float(request.form.get("price", 0))
+        unit = request.form.get("unit", "1 kg")
+        stock = int(request.form.get("stock", 50))
+        desc = request.form.get("description")
+        origin = request.form.get("origin", "Karnataka")
+
+        photo = request.files.get("product_photo")
+        filename = ""
+        if photo and photo.filename:
+            filename = f"manual_{int(datetime.now().timestamp())}_{secure_filename(photo.filename)}"
+            photo.save(UPLOAD_DIR / filename)
+
+        con.execute("""
+            INSERT INTO products(
+                product_name, name, category, description, price, unit, stock, image,
+                origin, farming_method, processing_info, storage_details, certification,
+                product_type, organic_tier, visible, status, created_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,'Active',?)
+        """, (
+            pname, pname, category, desc, price, unit, stock, filename, origin,
+            "100% Zero-Chemical Natural Farming", "Stone Hulled", "Store dry",
+            "NPOP Certified", "Finished Product", "High Organic Premium Grade", datetime.now().isoformat()
+        ))
+        con.commit()
+        con.close()
+        flash("Product manually injected and live instantly on customer website!")
+        return redirect(url_for("admin_store_products"))
+    con.close()
+    return render_admin("""
+    <h1>Manual Product Injector</h1>
+    <div class="card" style="max-width:700px;">
+        <p style="color:var(--muted);margin-bottom:14px;">Directly add any item to the live customer website without waiting for seller submission.</p>
+        <form method="post" enctype="multipart/form-data">
+            <label>Product Photo</label><input type="file" name="product_photo" accept="image/*" required style="background:#0d0d0d;padding:10px;">
+            <label>Category</label>
+            <select name="category" required>
+                {% for c in cats %}<option>{{ c['name'] }}</option>{% endfor %}
+            </select>
+            <label>Product Name</label><input name="product_name" required placeholder="e.g. Organic Brown Rice">
+            <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;">
+                <div><label>Price (₹)</label><input type="number" step="0.01" name="price" required placeholder="150"></div>
+                <div><label>Unit</label><select name="unit"><option>1 kg</option><option>500 g</option><option>250 g</option><option>1 Pack</option></select></div>
+                <div><label>Stock</label><input type="number" name="stock" required placeholder="100"></div>
+            </div>
+            <label>Origin</label><input name="origin" value="Mysuru, Karnataka" required>
+            <label>Description</label><textarea name="description" rows="3" required placeholder="Product purity and health benefits..."></textarea>
+            <button class="btn" style="width:100%;padding:14px;font-size:16px;">🚀 Inject Product Live to Website</button>
+        </form>
+    </div>
+    """, cats=cats)
+
+
+@app.route("/admin/sellers")
+@admin_guard
+def admin_sellers():
+    con = get_db()
+    rows = con.execute("""
+        SELECT s.*, COUNT(sp.id) AS total_items
+        FROM sellers s
+        LEFT JOIN seller_products sp ON sp.seller_id = s.id
+        GROUP BY s.id
+        ORDER BY s.id DESC
+    """).fetchall()
+    con.close()
+    return render_admin("""
+    <h1>Seller Management & Control</h1>
+    <div class="card">
+        <table>
+            <tr><th>ID</th><th>Business / Farm Name</th><th>Owner Name</th><th>Contact / Phone</th><th>Products</th><th>Status</th><th>Control Action</th></tr>
+            {% for r in rows %}
+            <tr>
+                <td>#{{r['id']}}</td>
+                <td><a href="{{ url_for('admin_seller_detail', sid=r['id']) }}" style="color:var(--gold);text-decoration:none;font-weight:700;font-size:16px;">🌾 {{r['business_name']}}</a></td>
+                <td>{{r['name']}}</td>
+                <td>{{r['phone']}}</td>
+                <td><a href="{{ url_for('admin_seller_detail', sid=r['id']) }}" style="color:#38bdf8;font-weight:600;">{{r['total_items']}} Item(s) →</a></td>
+                <td><b>{{r['status']}}</b></td>
+                <td>
+                    <div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;">
+                        <form method="post" action="{{ url_for('admin_seller_action', sid=r['id']) }}" style="display:flex;gap:6px;margin:0;">
+                            <select name="status" style="margin:0;width:auto;">
+                                <option {{'selected' if r['status']=='Pending' else ''}}>Pending</option>
+                                <option {{'selected' if r['status']=='Approved' else ''}}>Approved</option>
+                                <option {{'selected' if r['status']=='Rejected' else ''}}>Rejected</option>
+                            </select>
+                            <button class="btn" style="padding:6px 12px;">Update</button>
+                        </form>
+                        <form method="post" action="{{ url_for('admin_seller_inject_live', sid=r['id']) }}" style="margin:0;">
+                            <button type="submit" class="btn" style="padding:6px 12px;background:#15803d;color:white;border-color:#22c55e;">🚀 Inject Product Live to Website</button>
+                        </form>
+                    </div>
+                </td>
+            </tr>
+            {% endfor %}
+        </table>
+    </div>
+    """, rows=rows)
+
+
+@app.route("/admin/seller-detail/<int:sid>")
+@admin_guard
+def admin_seller_detail(sid):
+    con = get_db()
+    seller = con.execute("SELECT * FROM sellers WHERE id=?", (sid,)).fetchone()
+    products = con.execute("SELECT * FROM seller_products WHERE seller_id=? ORDER BY id DESC", (sid,)).fetchall()
+    con.close()
+    if not seller:
+        flash("Seller not found.")
+        return redirect(url_for("admin_sellers"))
+    return render_admin("""
+    <h1>Seller Profile & Products: {{ seller['business_name'] }}</h1>
+    <div class="card">
+        <p><b>Owner Name:</b> {{ seller['name'] }}</p>
+        <p><b>Business Name:</b> {{ seller['business_name'] }}</p>
+        <p><b>Phone / Mobile:</b> {{ seller['phone'] }}</p>
+        <p><b>Email:</b> {{ seller['email'] or 'N/A' }}</p>
+        <p><b>Account Status:</b> <span style="color:var(--gold);font-weight:700;">{{ seller['status'] }}</span></p>
+        <form method="post" action="{{ url_for('admin_seller_inject_live', sid=seller['id']) }}" style="margin-top:12px;">
+            <button type="submit" class="btn" style="background:#15803d;color:white;border-color:#22c55e;">🚀 Inject All Products Live to Website</button>
+        </form>
+    </div>
+    <h2>Products Submitted by this Seller</h2>
+    <div class="card">
+        {% if products %}
+        <table>
+            <tr><th>ID</th><th>Photo</th><th>Product Name</th><th>Category</th><th>Price</th><th>Status</th><th>Inspect & Live Action</th></tr>
+            {% for p in products %}
+            <tr>
+                <td>#{{ p['id'] }}</td>
+                <td>{% if p['image'] %}<img src="{{ url_for('uploaded_file', filename=p['image']) }}" style="width:55px;height:55px;object-fit:cover;border-radius:6px;">{% else %}<small style="color:var(--muted);">No Photo</small>{% endif %}</td>
+                <td><b>{{ p['product_name'] }}</b><br><small style="color:var(--muted);">{{ (p['description'] or '')[:60] }}</small></td>
+                <td><span style="color:var(--gold);font-weight:650;">{{ p['category'] }}</span></td>
+                <td>₹{{ p['price'] }} / {{ p['unit'] }}</td>
+                <td><b>{{ p['status'] }}</b></td>
+                <td>
+                    <div style="display:flex;gap:6px;flex-wrap:wrap;">
+                        <a href="{{ url_for('admin_inspect', pid=p['id']) }}" class="btn" style="padding:6px 12px;background:#1d4ed8;color:white;">Inspect Details</a>
+                        <form method="post" action="{{ url_for('admin_single_product_inject_live', pid=p['id']) }}" style="margin:0;">
+                            <button type="submit" class="btn" style="padding:6px 12px;background:#15803d;color:white;border-color:#22c55e;">🚀 Inject Live</button>
+                        </form>
+                    </div>
+                </td>
+            </tr>
+            {% endfor %}
+        </table>
+        {% else %}
+        <p style="color:var(--muted);">No products submitted by this seller yet.</p>
+        {% endif %}
+    </div>
+    """, seller=seller, products=products)
+
+
+@app.post("/admin/seller-action/<int:sid>")
+@admin_guard
+def admin_seller_action(sid):
+    status = request.form.get("status", "Pending")
+    con = get_db()
+    con.execute("UPDATE sellers SET status=? WHERE id=?", (status, sid))
+    if status == "Approved":
+        seller_items = con.execute("SELECT * FROM seller_products WHERE seller_id=?", (sid,)).fetchall()
+        for row in seller_items:
+            sync_seller_product_to_live(con, row)
+    con.commit()
+    con.close()
+    flash(f"Seller #{sid} status updated to {status}.")
+    return redirect(url_for("admin_sellers"))
+
+
+@app.post("/admin/seller-inject-live/<int:sid>")
+@admin_guard
+def admin_seller_inject_live(sid):
+    con = get_db()
+    seller = con.execute("SELECT * FROM sellers WHERE id=?", (sid,)).fetchone()
+    if not seller:
+        con.close()
+        flash(f"Seller #{sid} not found.")
+        return redirect(url_for("admin_sellers"))
+
+    con.execute("UPDATE sellers SET status='Approved' WHERE id=?", (sid,))
+    seller_items = con.execute("SELECT * FROM seller_products WHERE seller_id=?", (sid,)).fetchall()
+    if not seller_items:
+        con.commit()
+        con.close()
+        flash(f"Seller #{sid} ({seller['business_name']}) approved! Note: Seller has not submitted any products yet.")
+        return redirect(url_for("admin_sellers"))
+
+    injected_count = 0
+    for row in seller_items:
+        sync_seller_product_to_live(con, row)
+        injected_count += 1
+
+    con.commit()
+    con.close()
+    flash(f"🚀 {injected_count} product(s) from Seller #{sid} ({seller['business_name']}) injected live to the official website!")
+    return redirect(request.referrer or url_for("admin_sellers"))
+
+
+@app.post("/admin/product-inject-live/<int:pid>")
+@admin_guard
+def admin_single_product_inject_live(pid):
+    con = get_db()
+    row = con.execute("SELECT * FROM seller_products WHERE id=?", (pid,)).fetchone()
+    if not row:
+        con.close()
+        flash("Product not found.")
+        return redirect(url_for("admin_seller_products"))
+    con.execute("UPDATE sellers SET status='Approved' WHERE id=?", (row["seller_id"],))
+    sync_seller_product_to_live(con, row)
+    con.commit()
+    con.close()
+    flash(f"🚀 Product '{row['product_name']}' injected live to the official website in '{row['category']}'!")
+    return redirect(request.referrer or url_for("admin_seller_products"))
+
+
+@app.route("/admin/seller-products")
+@admin_guard
+def admin_seller_products():
+    con = get_db()
+    rows = con.execute("""
+        SELECT sp.*, s.business_name AS seller_business, s.phone AS seller_phone
+        FROM seller_products sp LEFT JOIN sellers s ON s.id=sp.seller_id ORDER BY sp.id DESC
+    """).fetchall()
+    con.close()
+    return render_admin("""
+    <h1>Product Approvals & 100% Inspector</h1>
+    <div class="card">
+        <p style="color:var(--muted);margin-bottom:14px;">Review 100% of seller-submitted column data and uploaded images. Upon approval or live injection, items sync instantly into their exact category on the official customer website.</p>
+        <table>
+            <tr><th>ID</th><th>Photo</th><th>Seller Business</th><th>Product Name & Category</th><th>Price</th><th>Status</th><th>Inspect & Live Sync</th></tr>
+            {% for r in rows %}
+            <tr>
+                <td>#{{r['id']}}</td>
+                <td>{% if r['image'] %}<img src="{{ url_for('uploaded_file', filename=r['image']) }}" style="width:55px;height:55px;object-fit:cover;border-radius:6px;">{% else %}<small style="color:var(--muted);">No Image</small>{% endif %}</td>
+                <td><b>{{r['seller_business']}}</b><br><small>{{r['seller_phone']}}</small></td>
+                <td><b>{{r['product_name']}}</b><br><span style="color:var(--gold);font-weight:600;">Category: {{r['category']}}</span></td>
+                <td>₹{{r['price']}} / {{r['unit']}}</td>
+                <td><b>{{r['status']}}</b></td>
+                <td>
+                    <div style="display:flex;gap:6px;flex-wrap:wrap;">
+                        <a href="{{ url_for('admin_inspect', pid=r['id']) }}" class="btn" style="padding:6px 12px;background:#1d4ed8;color:white;">Inspect All Details</a>
+                        <form method="post" action="{{ url_for('admin_single_product_inject_live', pid=r['id']) }}" style="margin:0;">
+                            <button type="submit" class="btn" style="padding:6px 12px;background:#15803d;color:white;border-color:#22c55e;">🚀 Inject Product Live to Website</button>
+                        </form>
+                    </div>
+                </td>
+            </tr>
+            {% endfor %}
+        </table>
+    </div>
+    """, rows=rows)
+
+
+@app.route("/admin/seller-product-inspect/<int:pid>", methods=["GET", "POST"])
+@admin_guard
+def admin_inspect(pid):
+    con = get_db()
+    row = con.execute("SELECT sp.*, s.business_name, s.phone, s.email FROM seller_products sp LEFT JOIN sellers s ON s.id=sp.seller_id WHERE sp.id=?", (pid,)).fetchone()
+    if not row:
+        con.close()
+        return redirect(url_for("admin_seller_products"))
+
+    if request.method == "POST":
+        action = request.form.get("action")
+        note = request.form.get("note", "").strip()
+
+        con.execute("UPDATE seller_products SET status=?, admin_note=? WHERE id=?", (action, note, pid))
+
+        if action == "Approved":
+            sync_seller_product_to_live(con, row)
+        else:
+            con.execute("UPDATE products SET visible=0, status='Hidden' WHERE seller_product_id=?", (pid,))
+        con.commit()
+        con.close()
+        flash(f"Product marked as {action}. Instantly synced to customer website category '{row['category']}'!")
+        return redirect(url_for("admin_seller_products"))
+    con.close()
+    return render_admin("""
+    <h1>100% Full Column Inspector & Image Review (#{{ row['id'] }})</h1>
+    <div class="card" style="display:grid;grid-template-columns:1.2fr 1.8fr;gap:26px;">
+        <div>
+            {% if row['image'] %}
+            <h3 style="color:var(--gold);margin-top:0;">Seller Uploaded Image</h3>
+            <img src="{{ url_for('uploaded_file', filename=row['image']) }}" style="width:100%;max-height:360px;object-fit:cover;border-radius:12px;border:2px solid var(--gold);margin-bottom:14px;">
+            {% else %}
+            <p style="color:var(--muted);">No Image Uploaded</p>
+            {% endif %}
+            <div style="background:#141414;padding:16px;border-radius:10px;border:1px solid var(--border);">
+                <h3 style="color:var(--gold);margin-top:0;">Seller Information</h3>
+                <p><b>Business:</b> {{ row['business_name'] }}</p>
+                <p><b>Phone:</b> {{ row['phone'] }}</p>
+                <p><b>Status:</b> <span style="color:var(--gold);font-weight:700;">{{ row['status'] }}</span></p>
+            </div>
+        </div>
+        <div>
+            <h2 style="margin-top:0;color:var(--gold);">{{ row['product_name'] }}</h2>
+            <div style="background:#142414;border:1px solid var(--gold);padding:14px;border-radius:8px;margin-bottom:16px;">
+                <p style="margin:0;color:var(--gold);font-size:16px;"><b>Target Category:</b> {{ row['category'] }} (Appears live instantly in this category upon approval)</p>
+            </div>
+
+            <h3 style="color:var(--gold);">100% Column Data Submitted by Seller</h3>
+            <div style="background:#141414;padding:18px;border-radius:10px;margin-bottom:16px;border:1px solid var(--border);display:grid;grid-template-columns:1fr 1fr;gap:12px;font-size:14px;">
+                <p><b>Product Name:</b> {{ row['product_name'] }}</p>
+                <p><b>Category:</b> {{ row['category'] }}</p>
+                <p><b>Product Type:</b> {{ row['product_type'] }}</p>
+                <p><b>Organic Tier:</b> {{ row['organic_tier'] }}</p>
+                <p><b>Price:</b> ₹{{ row['price'] }} / {{ row['unit'] }}</p>
+                <p><b>Stock Quantity:</b> {{ row['stock'] }}</p>
+                <p><b>Origin:</b> {{ row['origin'] }}</p>
+                <p><b>Farming Method:</b> {{ row['farming_method'] }}</p>
+                <p><b>Processing Info:</b> {{ row['processing_info'] }}</p>
+                <p><b>Storage Details:</b> {{ row['storage_details'] }}</p>
+                <p><b>Certification:</b> {{ row['certification'] }}</p>
+                <p><b>Delivery Days:</b> {{ row['delivery_days'] }}</p>
+                <p style="grid-column: span 2;"><b>Preferred Couriers:</b> 1. {{ row['courier_1'] }} | 2. {{ row['courier_2'] }}</p>
+                <p style="grid-column: span 2;"><b>Description / Highlights:</b> {{ row['description'] }}</p>
+            </div>
+
+            <form method="post">
+                <label>Admin Note / Feedback</label>
+                <textarea name="note" rows="2">{{ row['admin_note'] or '' }}</textarea>
+
+                <div style="display:flex;gap:12px;margin-top:14px;">
+                    <button type="submit" name="action" value="Approved" class="btn" style="background:#15803d;color:white;flex:1;">🚀 Inject Product Live to Website (Approve & Sync)</button>
+                    <button type="submit" name="action" value="Rejected" class="btn" style="flex:1;">❌ Reject Product</button>
+                </div>
+            </form>
+        </div>
+    </div>
+    """, row=row)
+
+
+@app.route("/admin/store-products")
+@admin_guard
+def admin_store_products():
+    con = get_db()
+    products = con.execute("SELECT * FROM products ORDER BY id DESC").fetchall()
+    con.close()
+    return render_admin("""
+    <h1>Store Products Control (Live Visibility & Category Sorting)</h1>
+    <div class="card">
+        <table>
+            <tr><th>ID</th><th>Photo</th><th>Product Name</th><th>Category</th><th>Price</th><th>Visibility</th><th>Action</th></tr>
+            {% for p in products %}
+            <tr>
+                <td>#{{ p['id'] }}</td>
+                <td>{% if p['image'] %}<img src="{{ url_for('uploaded_file', filename=p['image']) }}" style="width:50px;height:50px;object-fit:cover;border-radius:6px;">{% endif %}</td>
+                <td><b>{{ p['name'] or p['product_name'] }}</b></td>
+                <td><span style="color:var(--gold);font-weight:650;">{{ p['category'] }}</span></td>
+                <td>₹{{ p['price'] }} / {{ p['unit'] }}</td>
+                <td><b>{{ 'Visible (Active)' if p['visible']==1 else 'Hidden' }}</b></td>
+                <td>
+                    <form method="post" action="{{ url_for('admin_toggle_product', pid=p['id']) }}" style="margin:0;">
+                        <button class="btn" style="padding:6px 12px;background:{{ '#15803d' if p['visible']==1 else '#b8860b' }};color:white;">{{ 'Hide' if p['visible']==1 else 'Show' }}</button>
+                    </form>
+                </td>
+            </tr>
+            {% endfor %}
+        </table>
+    </div>
+    """, products=products)
+
+
+@app.post("/admin/store-product-toggle/<int:pid>")
+@admin_guard
+def admin_toggle_product(pid):
+    con = get_db()
+    cur = con.execute("SELECT visible FROM products WHERE id=?", (pid,)).fetchone()
+    if cur:
+        new_v = 0 if cur["visible"] == 1 else 1
+        con.execute("UPDATE products SET visible=? WHERE id=?", (new_v, pid))
+        con.commit()
+    con.close()
+    flash("Product visibility updated.")
+    return redirect(url_for("admin_store_products"))
+
+
+@app.route("/admin/orders")
+@admin_guard
+def admin_orders():
+    con = get_db()
+    rows = con.execute("SELECT o.*, p.courier_1, p.courier_2 FROM orders o LEFT JOIN products p ON p.id=o.product_id ORDER BY o.id DESC").fetchall()
+    con.close()
+    return render_admin("""
+    <h1>Orders, Payments & Courier Master Control</h1>
+    <div class="card">
+        <table>
+            <tr><th>ID</th><th>Customer & Courier Source</th><th>Ordered Items & Total</th><th>Payment & UTR Details</th><th>Order Status & Courier</th><th>Action</th></tr>
+            {% for o in rows %}
+            {% set st = (o['order_status'] or o['status'] or 'Pending') %}
+            <tr>
+                <td><b>#{{o['id']}}</b></td>
+                <td><b>{{o['customer_name']}}</b><br>{{o['customer_phone']}}<br><small style="color:var(--gold);">Source: {{o['courier_source'] or 'N/A'}}</small></td>
+                <td>{{o['items_summary'] or o['product_name']}}<br><b style="color:var(--gold);">₹{{o['total']}}</b></td>
+                <td>
+                    Mode: <b>{{o['payment_mode']}}</b><br>
+                    UTR / Ref ID: <b style="color:var(--gold);">{{o['upi_utr'] or 'N/A'}}</b><br>
+                    Status: <span style="color:#10b981;">{{o['payment_status']}}</span>
+                </td>
+                <td>
+                    {% if st == 'Rejected' %}
+                        <span style="color:#ef4444;font-weight:700;">❌ Rejected</span><br>
+                        <small style="color:#fca5a5;">Reason: {{ o['rejection_reason'] or 'N/A' }}</small>
+                    {% else %}
+                        <span style="color:var(--gold);font-weight:700;">{{ st }}</span><br>
+                        <small>Courier: <b>{{o['courier_name'] or 'Pending Assignment'}}</b></small>
+                    {% endif %}
+                </td>
+                <td>
+                    <div style="display:flex;flex-direction:column;gap:6px;">
+                        <a href="{{ url_for('admin_courier', oid=o['id']) }}" class="btn" style="background:#1d4ed8;color:white;padding:7px 12px;text-align:center;">Assign Courier</a>
+                        <a href="{{ url_for('admin_order_reject', oid=o['id']) }}" class="btn" style="background:#8b0000;color:white;padding:7px 12px;text-align:center;">❌ Reject Order</a>
+                    </div>
+                </td>
+            </tr>
+            {% endfor %}
+        </table>
+    </div>
+    """, rows=rows)
+
+
+@app.route("/admin/order-reject/<int:oid>", methods=["GET", "POST"])
+@admin_guard
+def admin_order_reject(oid):
+    con = get_db()
+    order = con.execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone()
+    if not order:
+        con.close()
+        flash("Order not found.")
+        return redirect(url_for("admin_orders"))
+    if request.method == "POST":
+        reason = request.form.get("rejection_reason", "").strip()
+        if not reason:
+            flash("Please enter a valid rejection reason so the customer can view it in My Orders.")
+            con.close()
+            return redirect(url_for("admin_order_reject", oid=oid))
+        con.execute(
+            "UPDATE orders SET order_status='Rejected', status='Rejected', rejection_reason=? WHERE id=?",
+            (reason, oid)
+        )
+        con.commit()
+        con.close()
+        flash(f"❌ Order #{oid} rejected with reason. Now visible in customer My Orders section.")
+        return redirect(url_for("admin_orders"))
+    con.close()
+    return render_admin("""
+    <h1>❌ Reject Order #{{ order['id'] }}</h1>
+    <div class="card" style="max-width:640px;">
+        <p><b>Customer:</b> {{ order['customer_name'] }} ({{ order['customer_phone'] }})</p>
+        <p><b>Ordered Items:</b> {{ order['items_summary'] or order['product_name'] }} — <b style="color:var(--gold);">₹{{ order['total'] }}</b></p>
+        <p><b>UPI UTR:</b> {{ order['upi_utr'] or 'N/A' }}</p>
+        <form method="post">
+            <label style="color:var(--gold);font-weight:700;">Reason for Rejecting Order (Visible to Customer in My Orders) *</label>
+            <textarea name="rejection_reason" rows="4" required placeholder="e.g., Invalid UPI UTR number / Payment not received / Out of stock...">{{ order['rejection_reason'] or '' }}</textarea>
+            <div style="display:flex;gap:12px;">
+                <button type="submit" class="btn" style="background:#991b1b;color:white;border-color:#ef4444;flex:1;">❌ Confirm Reject Order</button>
+                <a href="{{ url_for('admin_orders') }}" class="btn" style="background:#262626;flex:1;text-align:center;">Cancel</a>
+            </div>
+        </form>
+    </div>
+    """, order=order)
+
+
+@app.route("/admin/courier/<int:oid>", methods=["GET", "POST"])
+@admin_guard
+def admin_courier(oid):
+    con = get_db()
+    if request.method == "POST":
+        cname = request.form.get("courier_name")
+        tid = request.form.get("tracking_id")
+        contact = request.form.get("admin_contact")
+        msg = f"You can send the courier through {cname}. Admin Contact: {contact}"
+        con.execute(
+            "UPDATE orders SET courier=?, courier_name=?, tracking_id=?, seller_dispatch_msg=?, admin_contact=?, order_status='Shipped', status='Shipped' WHERE id=?",
+            (cname, cname, tid, msg, contact, oid)
+        )
+        con.commit()
+        con.close()
+        flash(f"Order #{oid} assigned to {cname} successfully.")
+        return redirect(url_for("admin_orders"))
+    order = con.execute(
+        "SELECT o.*, p.courier_1, p.courier_2, s.business_name FROM orders o LEFT JOIN products p ON p.id=o.product_id LEFT JOIN sellers s ON s.id=p.seller_id WHERE o.id=?",
+        (oid,)
+    ).fetchone()
+    c1 = order["courier_1"] or "India Post"
+    c2 = order["courier_2"] or "VRL Logistics"
+    con.close()
+    return render_admin("""
+    <h1>Assign Courier for Order #{{ order['id'] }}</h1>
+    <div class="card" style="max-width:640px;">
+        <p><b>Customer:</b> {{ order['customer_name'] }} ({{ order['customer_phone'] }})</p>
+        <p><b>UPI Transaction ID (UTR):</b> <span style="color:var(--gold);font-weight:700;">{{ order['upi_utr'] or 'N/A' }}</span></p>
+        <p><b>Selected Courier Source Network:</b> {{ order['courier_source'] }}</p>
+        <p><b>Seller Preferred Couriers:</b> 1. {{ c1 }} | 2. {{ c2 }}</p>
+        <form method="post">
+            <label>Select Courier ("You can send the courier through...")</label>
+            <select name="courier_name" required>
+                <option value="{{ c1 }}">{{ c1 }} (Seller Choice 1)</option>
+                <option value="{{ c2 }}">{{ c2 }} (Seller Choice 2)</option>
+                <option value="India Post">India Post</option>
+                <option value="VRL Logistics">VRL Logistics</option>
+                <option value="DTDC">DTDC</option>
+                <option value="Delhivery">Delhivery</option>
+            </select>
+            <label>Admin Contact Number</label><input name="admin_contact" value="+91 98765 43210" required>
+            <label>Tracking ID / Waybill Number</label><input name="tracking_id" value="RR{{ order['id'] }}IND" required>
+            <button class="btn" style="background:#15803d;color:white;width:100%;margin-top:10px;">✅ Confirm Assignment & Notify Seller</button>
+        </form>
+    </div>
+    """, order=order, c1=c1, c2=c2)
+
+
+@app.route("/admin/support-tickets", methods=["GET", "POST"])
+@admin_guard
+def admin_support():
+    con = get_db()
+    if request.method == "POST":
+        tid = request.form.get("ticket_id")
+        reply = request.form.get("admin_reply")
+        con.execute("UPDATE support_tickets SET admin_reply=?, status='Resolved' WHERE id=?", (reply, tid))
+        con.commit()
+        flash(f"Support ticket #{tid} resolved and replied successfully.")
+    tickets = con.execute("SELECT * FROM support_tickets ORDER BY id DESC").fetchall()
+    con.close()
+    return render_admin("""
+    <h1>💬 Customer Support Tickets Center</h1>
+    <div class="card">
+        <table>
+            <tr><th>ID</th><th>Customer & Phone</th><th>Subject & Message</th><th>Status</th><th>Reply & Resolve</th></tr>
+            {% for t in tickets %}
+            <tr>
+                <td><b>#{{ t['id'] }}</b></td>
+                <td><b>{{ t['customer_name'] }}</b><br>{{ t['customer_phone'] }}</td>
+                <td><b>{{ t['subject'] }}</b><br>{{ t['message'] }}</td>
+                <td><span style="color:var(--gold);">{{ t['status'] }}</span></td>
+                <td>
+                    <form method="post" style="display:flex;gap:8px;margin:0;">
+                        <input type="hidden" name="ticket_id" value="{{ t['id'] }}">
+                        <input name="admin_reply" placeholder="Type resolution reply..." value="{{ t['admin_reply'] or '' }}" required style="margin:0;">
+                        <button class="btn" style="padding:6px 12px;background:#15803d;color:white;">Reply</button>
+                    </form>
+                </td>
+            </tr>
+            {% endfor %}
+        </table>
+    </div>
+    """, tickets=tickets)
+
+
+@app.route("/admin/reports")
+@admin_guard
+def admin_reports():
+    return render_admin("""
+    <h1>📊 Reports & Downloadable CSV Exports</h1>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:20px;">
+        <div class="card">
+            <h3>Export All Orders Report</h3>
+            <p style="color:var(--muted);font-size:14px;">Download complete transactional ledger including customer addresses, UTR numbers, payment statuses, and courier sources.</p>
+            <a href="{{ url_for('export_csv', report_type='orders') }}" class="btn" style="background:var(--gold);color:#0a0a0a;display:inline-block;margin-top:10px;">📥 Download Orders CSV</a>
+        </div>
+        <div class="card">
+            <h3>Export Live Products Report</h3>
+            <p style="color:var(--muted);font-size:14px;">Download inventory list of active store products, categories, pricing, and stock levels.</p>
+            <a href="{{ url_for('export_csv', report_type='products') }}" class="btn" style="background:var(--gold);color:#0a0a0a;display:inline-block;margin-top:10px;">📥 Download Products CSV</a>
+        </div>
+        <div class="card">
+            <h3>Export Support Tickets Report</h3>
+            <p style="color:var(--muted);font-size:14px;">Download customer support inquiries and resolution history.</p>
+            <a href="{{ url_for('export_csv', report_type='support') }}" class="btn" style="background:var(--gold);color:#0a0a0a;display:inline-block;margin-top:10px;">📥 Download Support CSV</a>
+        </div>
+    </div>
+    """)
+
+
+@app.route("/admin/export/<report_type>")
+@admin_guard
+def export_csv(report_type):
+    con = get_db()
+    output = io.StringIO()
+    writer = csv.writer(output)
+
+    if report_type == "orders":
+        rows = con.execute("SELECT * FROM orders ORDER BY id DESC").fetchall()
+        filename = "orders_report.csv"
+        if rows:
+            writer.writerow(rows[0].keys())
+            for r in rows:
+                writer.writerow(dict(r).values())
+    elif report_type == "products":
+        rows = con.execute("SELECT * FROM products ORDER BY id DESC").fetchall()
+        filename = "products_report.csv"
+        if rows:
+            writer.writerow(rows[0].keys())
+            for r in rows:
+                writer.writerow(dict(r).values())
+    elif report_type == "support":
+        rows = con.execute("SELECT * FROM support_tickets ORDER BY id DESC").fetchall()
+        filename = "support_report.csv"
+        if rows:
+            writer.writerow(rows[0].keys())
+            for r in rows:
+                writer.writerow(dict(r).values())
+    else:
+        con.close()
+        return "Invalid report type", 404
+
+    con.close()
+    output.seek(0)
+    return Response(output.getvalue(), mimetype="text/csv", headers={"Content-Disposition": f"attachment;filename={filename}"})
+
+
+@app.route("/admin/announcements", methods=["GET", "POST"])
+@admin_guard
+def admin_announcements():
+    con = get_db()
+    if request.method == "POST":
+        title = request.form.get("title")
+        announcement_type = request.form.get("announcement_type", "OFFER")
+        msg = request.form.get("message")
+        con.execute(
+            "INSERT INTO announcements(title, announcement_type, message, active, created_at) VALUES(?, ?, ?, 1, ?)",
+            (title, announcement_type, msg, datetime.now().isoformat())
+        )
+        con.commit()
+        flash("Ad / Announcement published successfully to live website banner!")
+    announcements = con.execute("SELECT * FROM announcements ORDER BY id DESC").fetchall()
+    con.close()
+    return render_admin("""
+    <h1>📢 Ad Controlling System & Live Banner Telecasting</h1>
+    <div class="card" style="max-width:740px;">
+        <h3>Add New Advertisement / Announcement</h3>
+        <form method="post">
+            <label>Add Name / Title</label><input name="title" required placeholder="e.g. Festival Organic Rice Special Offer">
+            <label>Add Announcement Type</label>
+            <select name="announcement_type" required>
+                <option value="OFFER">OFFER</option>
+                <option value="FESTIVAL DISCOUNT">FESTIVAL DISCOUNT</option>
+                <option value="NEW ARRIVAL">NEW ARRIVAL</option>
+                <option value="ORGANIC ALERT">ORGANIC ALERT</option>
+                <option value="IMPORTANT NOTICE">IMPORTANT NOTICE</option>
+            </select>
+            <label>Message Content / Banner Text</label>
+            <textarea name="message" rows="3" required placeholder="Enter announcement text to be telecasted live on the website..."></textarea>
+            <button class="btn" style="width:100%;padding:14px;font-size:16px;">📢 Publish Live on Website Banner</button>
+        </form>
+    </div>
+
+    <div class="card">
+        <h3>Active Ads & Banners (Live Ticker Animation)</h3>
+        <table>
+            <tr><th>ID</th><th>Add Name / Title</th><th>Type</th><th>Message Content</th><th>Status</th><th>Action</th></tr>
+            {% for a in announcements %}
+            <tr>
+                <td>#{{ a['id'] }}</td>
+                <td><b>{{ a['title'] }}</b></td>
+                <td><span style="background:var(--theme);color:white;padding:3px 8px;border-radius:4px;font-size:11px;">{{ a['announcement_type'] }}</span></td>
+                <td>{{ a['message'] }}</td>
+                <td><b>Active</b></td>
+                <td>
+                    <form method="post" action="{{ url_for('admin_delete_announcement', aid=a['id']) }}" style="margin:0;">
+                        <button class="btn" style="padding:6px 12px;background:#8b0000;">Delete / Stop</button>
+                    </form>
+                </td>
+            </tr>
+            {% endfor %}
+        </table>
+    </div>
+    """, announcements=announcements)
+
+
+@app.route("/admin/ad-telecast", methods=["GET", "POST"])
+@admin_guard
+def admin_ad_telecast():
+    con = get_db()
+    ads = con.execute("SELECT * FROM ad_telecasts ORDER BY id ASC").fetchall()
+    if request.method == "POST":
+        if len(ads) >= 5:
+            flash("⚠️ Maximum 5 Ads allowed in Ad Telecast! Please remove an existing ad before adding a new one.")
+            con.close()
+            return redirect(url_for("admin_ad_telecast"))
+        title = request.form.get("title", "").strip() or f"Telecast Ad #{len(ads)+1}"
+        ad_file = request.files.get("ad_image")
+        if not ad_file or not ad_file.filename:
+            flash("⚠️ Please select a media file (Image or Video) matching the Hero Banner box size.")
+            con.close()
+            return redirect(url_for("admin_ad_telecast"))
+        filename = f"ad_telecast_{int(datetime.now().timestamp())}_{secure_filename(ad_file.filename)}"
+        ad_file.save(UPLOAD_DIR / filename)
+        con.execute("INSERT INTO ad_telecasts(title, image_file, active, created_at) VALUES(?, ?, 1, ?)", (title, filename, datetime.now().isoformat()))
+        con.commit()
+        con.close()
+        flash("📺 Ad Telecast published live to Customer Portal Hero Banner!")
+        return redirect(url_for("admin_ad_telecast"))
+    con.close()
+    return render_admin("""
+    <h1>📺 Ad Telecast — Hero Banner Overlay Control (Max 5 Ads)</h1>
+    <div class="card" style="max-width:760px;">
+        <h3 style="margin-top:0;">Upload & Display New Hero Banner Ad or Video ({{ ads|length }} / 5 Active)</h3>
+        <p style="color:var(--muted);font-size:13.5px;line-height:1.6;">
+            • <b>Recommended Banner Size:</b> <code>1200 × 240 px</code> (Wide Horizontal 5:1 Ratio).<br>
+            • <b>Supported Formats:</b> Images (JPG, PNG, GIF) or Videos (MP4, WEBM).<br>
+            • <b>Telecast Behavior:</b> Smooth fade & zoom crossfade between Main Royal Rices Banner and Ad Media every 5 seconds.
+        </p>
+        {% if ads|length < 5 %}
+        <form method="post" enctype="multipart/form-data">
+            <label>Ad Title / Reference Label (Optional)</label>
+            <input type="text" name="title" placeholder="e.g. India Gate Basmati Offer Video/Image">
+            <label>Select Banner Image or Video File *</label>
+            <input type="file" name="ad_image" accept="image/*,video/mp4,video/webm,video/quicktime" required style="background:#0d0d0d;padding:10px;border:1px solid var(--gold);">
+            <button type="submit" class="btn" style="width:100%;padding:14px;font-size:16px;background:#15803d;color:white;border-color:#22c55e;">📺 Display Live on Customer Portal</button>
+        </form>
+        {% else %}
+        <div style="background:#2a1212;border:1px solid #ef4444;padding:14px;border-radius:8px;color:#fca5a5;font-weight:600;">
+            Maximum limit of 5 active Telecast Ads reached. Delete an existing ad below to upload a new one.
+        </div>
+        {% endif %}
+    </div>
+
+    <div class="card">
+        <h3>Active Telecast Queue ({{ ads|length }} / 5)</h3>
+        {% if ads %}
+        <table>
+            <tr><th>Slot</th><th>Preview (Hero Box Ratio)</th><th>Ad Title</th><th>Added On</th><th>Action</th></tr>
+            {% for a in ads %}
+            <tr>
+                <td><b>Slot #{{ loop.index }}</b></td>
+                <td>
+                    {% if a['image_file'].lower().endswith(('.mp4', '.webm', '.mov')) %}
+                    <video src="{{ url_for('uploaded_file', filename=a['image_file']) }}" style="width:260px;height:56px;object-fit:cover;border-radius:8px;border:1px solid var(--gold);" autoplay muted loop playsinline></video>
+                    {% else %}
+                    <img src="{{ url_for('uploaded_file', filename=a['image_file']) }}" style="width:260px;height:56px;object-fit:cover;border-radius:8px;border:1px solid var(--gold);">
+                    {% endif %}
+                </td>
+                <td><b>{{ a['title'] }}</b></td>
+                <td><small style="color:var(--muted);">{{ (a['created_at'] or '')[:16].replace('T', ' ') }}</small></td>
+                <td>
+                    <form method="post" action="{{ url_for('admin_ad_telecast_delete', aid=a['id']) }}" style="margin:0;">
+                        <button type="submit" class="btn" style="padding:7px 14px;background:#8b0000;color:white;">🗑️ Remove Ad</button>
+                    </form>
+                </td>
+            </tr>
+            {% endfor %}
+        </table>
+        {% else %}
+        <p style="color:var(--muted);">No telecast ads active right now. The main ROYAL RICES hero banner is displayed normally on the customer portal.</p>
+        {% endif %}
+    </div>
+    """, ads=ads)
+
+
+@app.post("/admin/ad-telecast-delete/<int:aid>")
+@admin_guard
+def admin_ad_telecast_delete(aid):
+    con = get_db()
+    row = con.execute("SELECT image_file FROM ad_telecasts WHERE id=?", (aid,)).fetchone()
+    if row and row["image_file"]:
+        try:
+            img_path = UPLOAD_DIR / row["image_file"]
+            if img_path.exists():
+                img_path.unlink()
+        except Exception:
+            pass
+    con.execute("DELETE FROM ad_telecasts WHERE id=?", (aid,))
+    con.commit()
+    con.close()
+    flash("🗑️ Ad removed from Ad Telecast queue.")
+    return redirect(url_for("admin_ad_telecast"))
+
+
+@app.post("/admin/announcement-delete/<int:aid>")
+@admin_guard
+def admin_delete_announcement(aid):
+    con = get_db()
+    con.execute("DELETE FROM announcements WHERE id=?", (aid,))
+    con.commit()
+    con.close()
+    flash("Announcement removed successfully.")
+    return redirect(url_for("admin_announcements"))
+
+
+@app.route("/admin/update-guide")
+@admin_guard
+def admin_update_guide():
+    return render_admin("""
+    <h1>⚙️ Software & Application Update Guide</h1>
+    <div class="card" style="line-height:1.7;">
+        <h3 style="color:var(--gold);">How to Update the Single-File Application</h3>
+        <ol>
+            <li><b>Database Backup:</b> Before updating, make a safe backup copy of your <code>royal_rices.db</code> file to protect all existing data.</li>
+            <li><b>Code Replacement:</b> Replace this single Python file with the updated version. Your existing orders, products, and sellers remain intact inside <code>royal_rices.db</code>.</li>
+            <li><b>Restart Application:</b> Run the single Python file to start all portals together.</li>
+        </ol>
+    </div>
+    """)
+
+
+@app.route("/admin/payment-settings", methods=["GET", "POST"])
+@admin_guard
+def admin_payment_settings():
+    con = get_db()
+    if request.method == "POST":
+        upi_id = request.form.get("upi_id", "").strip()
+        scanner_file = request.files.get("scanner_image")
+
+        if upi_id:
+            con.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('upi_id', ?)", (upi_id,))
+
+        if scanner_file and scanner_file.filename:
+            filename = f"scanner_{int(datetime.now().timestamp())}_{secure_filename(scanner_file.filename)}"
+            scanner_file.save(UPLOAD_DIR / filename)
+            con.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('scanner_image', ?)", (filename,))
+
+        con.commit()
+        con.close()
+        flash("Payment settings (Scanner & UPI ID) updated successfully!")
+        return redirect(url_for("admin_payment_settings"))
+
+    settings = dict(con.execute("SELECT key, value FROM settings").fetchall())
+    con.close()
+
+    return render_admin("""
+    <h1>💳 Payment Settings</h1>
+    <div class="card" style="max-width:650px;">
+        <p style="color:var(--muted);margin-bottom:18px;">Manage your payment gateway details here: update the QR Scanner image and the UPI ID. Changes reflect immediately on the customer checkout page.</p>
+        <form method="post" enctype="multipart/form-data">
+
+            <label><b>Current Scanner Preview:</b></label><br>
+            {% if settings.get('scanner_image') %}
+            <img src="{{ url_for('uploaded_file', filename=settings.get('scanner_image')) }}" style="max-width:180px;border-radius:8px;border:1px solid var(--gold);margin-bottom:12px;"><br>
+            {% else %}
+            <p style="color:var(--muted);">No scanner uploaded yet.</p>
+            {% endif %}
+
+            <label>Upload New QR Scanner Image</label>
+            <input type="file" name="scanner_image" accept="image/*" style="background:#0d0d0d;padding:10px;">
+
+            <label>UPI ID / VPA</label>
+            <input type="text" name="upi_id" value="{{ settings.get('upi_id', 'r39446772@okicici') }}" required>
+
+            <button class="btn" style="width:100%;padding:14px;font-size:16px;margin-top:10px;">💾 Save Payment Settings</button>
+        </form>
+    </div>
+    """, settings=settings)
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=True)
